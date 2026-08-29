@@ -1423,11 +1423,9 @@ function formatFileSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-const DEFAULT_MAX_SYNTHESIS_SEC = 180;
-
 function maxSynthesisSeconds() {
   const n = Number(systemStats?.features?.max_synthesis_duration_seconds);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_SYNTHESIS_SEC;
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 function formatDurationCn(sec) {
@@ -1440,7 +1438,7 @@ function formatDurationCn(sec) {
 
 function durationLimitMessage(kind, actualSec, maxSec) {
   const label = kind === 'audio' ? '音频' : '形象视频';
-  return `${label}时长 ${formatDurationCn(actualSec)} 超过上限 ${formatDurationCn(maxSec)}，请使用不超过 3 分钟的素材`;
+  return `${label}时长 ${formatDurationCn(actualSec)} 超过上限 ${formatDurationCn(maxSec)}`;
 }
 
 function probeFileDuration(file) {
@@ -1527,9 +1525,24 @@ $('#avatarForm')?.addEventListener('submit', async (e) => {
   }
   const btn = $('#avatarSubmit');
   const bar = $('#uploadBar');
+  const progress = $('#uploadProgress');
+  const status = $('#uploadStatus');
+  const setP = (p) => {
+    const pct = Math.max(0, Math.min(100, Math.round(p)));
+    if (bar) bar.style.width = pct + '%';
+    if (status) status.textContent = pct + '%';
+  };
+  const resetUploadUi = () => {
+    form.reset();
+    setAvatarVideoLabel(null);
+    $('#avatarUserWrap')?.classList.toggle('hidden', true);
+    if (bar) bar.style.width = '0%';
+    if (status) status.textContent = '0%';
+    progress?.classList.add('hidden');
+  };
   btn.disabled = true;
-  $('#uploadProgress').classList.remove('hidden');
-  const setP = (p, t) => { bar.style.width = p + '%'; $('#uploadStatus').textContent = t; };
+  progress?.classList.remove('hidden');
+  setP(0);
   try {
     const chunkSize = 8 * 1024 * 1024;
     const total = Math.ceil(file.size / chunkSize);
@@ -1550,7 +1563,7 @@ $('#avatarForm')?.addEventListener('submit', async (e) => {
       c.append('chunk_index', String(i));
       c.append('total_chunks', String(total));
       c.append('chunk', file.slice(i * chunkSize, (i + 1) * chunkSize));
-      setP((i / total) * 95, `上传 ${i + 1}/${total}`);
+      setP(((i + 1) / total) * 100);
       const { data: cr } = await api('/api/avatars/upload', { method: 'POST', body: c });
       if (cr.code !== 0) throw new Error(cr.msg);
     }
@@ -1559,12 +1572,11 @@ $('#avatarForm')?.addEventListener('submit', async (e) => {
     done.append('upload_id', uid);
     const { data: fr } = await api('/api/avatars/upload', { method: 'POST', body: done });
     if (fr.code !== 0) throw new Error(fr.msg);
+    setP(100);
     toast('上传成功，正在处理', 'success');
     const uploadedType = form.type.value;
     const uploadedUser = form.username?.value?.trim() || '';
-    form.reset();
-    setAvatarVideoLabel(null);
-    $('#avatarUserWrap')?.classList.toggle('hidden', true);
+    resetUploadUi();
     if (uploadedType === 'private' && uploadedUser) {
       avatarTab = 'private';
       avatarPrivatePage = 1;

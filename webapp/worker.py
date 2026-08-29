@@ -85,6 +85,7 @@ def prepare_character(character_id: str) -> None:
     char_dir = STORAGE / "characters" / character_id
     char_dir.mkdir(parents=True, exist_ok=True)
     video_out = char_dir / "video.mp4"
+    preview_out = char_dir / "preview.mp4"
     poster_out = char_dir / "poster.jpg"
     source = Path(char["source_path"])
 
@@ -107,17 +108,25 @@ def prepare_character(character_id: str) -> None:
                 _ffmpeg_prepare_video(source, video_out)
         if not poster_out.exists():
             _extract_poster(video_out, poster_out)
+        if not preview_out.exists() or preview_out.stat().st_size < 1000:
+            with db.db() as conn:
+                conn.execute(
+                    "UPDATE characters SET progress = ? WHERE id = ?",
+                    ("生成预览", character_id),
+                )
+            _ffmpeg_preview_video(video_out, preview_out)
         meta = _probe(video_out)
         with db.db() as conn:
             conn.execute(
                 """
                 UPDATE characters
-                SET video_path = ?, poster_path = ?, duration = ?, width = ?, height = ?,
+                SET video_path = ?, preview_path = ?, poster_path = ?, duration = ?, width = ?, height = ?,
                     status = ?, progress = ?, error = NULL
                 WHERE id = ?
                 """,
                 (
                     str(video_out),
+                    str(preview_out) if preview_out.exists() else None,
                     str(poster_out) if poster_out.exists() else None,
                     meta.get("duration"),
                     meta.get("width"),
@@ -134,6 +143,36 @@ def prepare_character(character_id: str) -> None:
                 "UPDATE characters SET status = ?, error = ?, progress = NULL WHERE id = ?",
                 ("failed", str(exc), character_id),
             )
+
+
+def ensure_preview(character_id: str) -> None:
+    """为已就绪、缺预览片的形象补生成低码率预览（不改变 ready 状态）。"""
+    with db.db() as conn:
+        row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
+        if row is None:
+            return
+        char = dict(row)
+    video = Path(char["video_path"]) if char.get("video_path") else None
+    if not video or not video.exists():
+        return
+    preview_out = Path(char["preview_path"]) if char.get("preview_path") else video.parent / "preview.mp4"
+    if preview_out.exists() and preview_out.stat().st_size >= 1000:
+        with db.db() as conn:
+            conn.execute(
+                "UPDATE characters SET preview_path = ? WHERE id = ? AND (preview_path IS NULL OR preview_path = '')",
+                (str(preview_out), character_id),
+            )
+        return
+    try:
+        _ffmpeg_preview_video(video, preview_out)
+        with db.db() as conn:
+            conn.execute(
+                "UPDATE characters SET preview_path = ? WHERE id = ?",
+                (str(preview_out), character_id),
+            )
+        print(f"Character {character_id} preview ready")
+    except Exception as exc:
+        print(f"Character {character_id} preview failed: {exc}")
 
 
 def _fps_from_ratio(raw) -> Optional[float]:
@@ -203,6 +242,41 @@ def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
     )
 
 
+def _ffmpeg_preview_video(src: Path, dst: Path) -> None:
+    """网页预览用低码率片：最高 720p、CRF28、faststart，合成仍用 video.mp4。"""
+    tmp = dst.with_suffix(".tmp.mp4")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(src),
+                "-vf",
+                r"scale=-2:min(720\,ih)",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "28",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-an",
+                str(tmp),
+            ],
+            check=True,
+        )
+        tmp.replace(dst)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _probe(path: Path) -> dict:
     result = subprocess.run(
         [
@@ -251,10 +325,17 @@ def _kick_character_prepare() -> None:
     if _char_thread and _char_thread.is_alive():
         return
     character_id = _pick_character_to_prepare()
-    if not character_id:
+    if character_id:
+        _char_thread = threading.Thread(
+            target=prepare_character, args=(character_id,), name="latentsync-prepare", daemon=True
+        )
+        _char_thread.start()
+        return
+    preview_id = _pick_character_needing_preview()
+    if not preview_id:
         return
     _char_thread = threading.Thread(
-        target=prepare_character, args=(character_id,), name="latentsync-prepare", daemon=True
+        target=ensure_preview, args=(preview_id,), name="latentsync-preview", daemon=True
     )
     _char_thread.start()
 
@@ -266,6 +347,25 @@ def _pick_character_to_prepare() -> Optional[str]:
             ("queued",),
         ).fetchone()
         if row is not None:
+            return row["id"]
+    return None
+
+
+def _pick_character_needing_preview() -> Optional[str]:
+    with db.db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, video_path, preview_path FROM characters
+            WHERE status = 'ready' AND video_path IS NOT NULL
+            ORDER BY created_at
+            """
+        ).fetchall()
+    for row in rows:
+        preview = Path(row["preview_path"]) if row["preview_path"] else None
+        if preview and preview.exists() and preview.stat().st_size >= 1000:
+            continue
+        video = Path(row["video_path"]) if row["video_path"] else None
+        if video and video.exists():
             return row["id"]
     return None
 

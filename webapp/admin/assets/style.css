@@ -1344,8 +1344,10 @@ body::before {
   border-color: rgba(124, 108, 255, 0.45);
 }
 
-.avatar-page-grid .media-card.is-ready .card-actions .btn-primary {
-  flex: 1 1 100%;
+.avatar-page-grid .card-actions .btn {
+  flex: 1 1 0;
+  min-width: 0;
+  justify-content: center;
 }
 
 .avatar-page-grid .card-body {
@@ -1370,8 +1372,10 @@ body::before {
 }
 
 .avatar-page-grid .card-actions {
+  display: flex;
   gap: 8px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  align-items: stretch;
 }
 
 .avatar-page-grid .card-actions .btn-sm {
@@ -2309,7 +2313,7 @@ body::before {
   }
 
   .avatar-page-grid .card-actions {
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
   }
 
   .avatar-page-grid .card-actions .btn-bake {

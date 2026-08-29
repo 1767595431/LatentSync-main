@@ -96,6 +96,7 @@ def init_db() -> None:
                 ("face_cache_path", "TEXT"),
                 ("type", "TEXT"),
                 ("user_id", "TEXT"),
+                ("preview_path", "TEXT"),
             ):
                 if name not in char_cols:
                     conn.execute(f"ALTER TABLE characters ADD COLUMN {name} {typ}")

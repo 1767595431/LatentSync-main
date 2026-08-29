@@ -335,10 +335,18 @@ def character_poster(character_id: str):
 @app.get("/api/characters/{character_id}/video")
 def character_video(character_id: str):
     with db.db() as conn:
-        row = conn.execute("SELECT video_path FROM characters WHERE id = ?", (character_id,)).fetchone()
-    if row is None or not row["video_path"] or not Path(row["video_path"]).exists():
+        row = conn.execute(
+            "SELECT video_path, preview_path FROM characters WHERE id = ?",
+            (character_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, "形象不存在")
+    preview = Path(row["preview_path"]) if row["preview_path"] else None
+    full = Path(row["video_path"]) if row["video_path"] else None
+    path = preview if preview and preview.exists() else full
+    if path is None or not path.exists():
         raise HTTPException(404, "形象视频不存在")
-    return FileResponse(row["video_path"], media_type="video/mp4", filename=f"{character_id}.mp4")
+    return FileResponse(path, media_type="video/mp4", filename=f"{character_id}.mp4")
 
 
 @app.delete("/api/characters/{character_id}")
@@ -504,11 +512,16 @@ def rebake_avatar(identifier: str):
         if row is None:
             return fail("形象不存在")
         char = dict(row)
-        video = Path(char["video_path"]) if char.get("video_path") else None
-        if video and video.exists():
-            video.unlink(missing_ok=True)
+        for key in ("video_path", "preview_path"):
+            path = Path(char[key]) if char.get(key) else None
+            if path and path.exists():
+                path.unlink(missing_ok=True)
         conn.execute(
-            "UPDATE characters SET status = ?, error = NULL, progress = ?, video_path = NULL WHERE id = ?",
+            """
+            UPDATE characters
+            SET status = ?, error = NULL, progress = ?, video_path = NULL, preview_path = NULL
+            WHERE id = ?
+            """,
             ("queued", "转码中", identifier),
         )
     return ok({"identifier": identifier}, "已重新排队转码")
