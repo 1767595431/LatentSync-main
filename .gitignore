@@ -1,0 +1,93 @@
+# 编辑器与系统
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+/venv/
+.venv/
+
+# 训练 / 调试输出
+wandb/
+*debug*
+/debug
+/output
+/validation
+/test
+/models/
+/detect_results/
+/temp
+/temp_*
+/data/
+.cog/
+
+# 权重与模型文件
+/checkpoints/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# 运行时数据库与缓存
+**/.cache/
+.huggingface/
+*.npy
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Web API 运行时数据（上传、转码、成片、分片）
+/webapp/storage/
+
+# 音视频与数据文件
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
+*.ogg
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.csv
+*.pdf
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 前端依赖
+node_modules/
+
+# 仓库内需要保留的静态资源
+!/latentsync/utils/mask*.png
+!/assets/**
+!/docs/**
+!/internal/*.png
+!/webapp/admin/assets/**

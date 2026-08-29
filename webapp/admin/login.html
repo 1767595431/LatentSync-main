@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#07080d">
+  <title>QeMix数字人平台 · 访问验证</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg0: #07080d;
+      --glass: rgba(22, 27, 38, 0.85);
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f3f5f9;
+      --muted: #8b95a8;
+      --accent: #7c6cff;
+      --grad: linear-gradient(135deg, #7c6cff 0%, #4fd1c5 100%);
+      --danger: #f87171;
+      --radius: 18px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100dvh;
+      font-family: "Inter", "Noto Sans SC", system-ui, sans-serif;
+      background: var(--bg0);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+      padding: 24px 16px calc(24px + env(safe-area-inset-bottom, 0px));
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(124,108,255,.25), transparent),
+        radial-gradient(ellipse 60% 40% at 90% 10%, rgba(79,209,197,.14), transparent);
+      pointer-events: none;
+      z-index: 0;
+    }
+    .card {
+      position: relative;
+      z-index: 1;
+      width: min(420px, 100%);
+      background: var(--glass);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 32px 28px 28px;
+      backdrop-filter: blur(16px);
+      box-shadow: 0 24px 64px rgba(0,0,0,.45);
+    }
+    .brand {
+      width: 52px;
+      height: 52px;
+      border-radius: 16px;
+      background: var(--grad);
+      display: grid;
+      place-items: center;
+      font-weight: 800;
+      font-size: 22px;
+      color: #fff;
+      margin-bottom: 18px;
+      box-shadow: 0 8px 28px rgba(124,108,255,.4);
+    }
+    h1 {
+      font-size: 24px;
+      font-weight: 750;
+      letter-spacing: -.03em;
+      margin-bottom: 6px;
+    }
+    .sub {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 24px;
+      line-height: 1.5;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      margin-bottom: 8px;
+      letter-spacing: .03em;
+    }
+    input {
+      width: 100%;
+      min-height: 48px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: rgba(0,0,0,.28);
+      color: var(--text);
+      font: inherit;
+      font-size: 16px;
+      outline: none;
+    }
+    input:focus {
+      border-color: rgba(124,108,255,.55);
+      box-shadow: 0 0 0 3px rgba(124,108,255,.16);
+    }
+    button {
+      width: 100%;
+      min-height: 48px;
+      margin-top: 18px;
+      border: none;
+      border-radius: 12px;
+      background: var(--grad);
+      color: #fff;
+      font: inherit;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      box-shadow: 0 6px 24px rgba(124,108,255,.35);
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .err {
+      margin-top: 14px;
+      min-height: 18px;
+      font-size: 13px;
+      color: var(--danger);
+      font-weight: 600;
+    }
+    .hint {
+      margin-top: 18px;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">Q</div>
+    <h1>QeMix数字人平台</h1>
+    <p class="sub">请输入访问密钥后进入工作台。知道链接地址也无法直接操作。</p>
+    <form id="gateForm" autocomplete="off">
+      <label for="keyInput">访问密钥</label>
+      <input id="keyInput" name="key" type="password" autocomplete="current-password" placeholder="请输入密钥" required autofocus>
+      <button type="submit" id="submitBtn">进入工作台</button>
+      <div class="err" id="errBox" aria-live="polite"></div>
+    </form>
+    <p class="hint">关闭本页、关闭标签，或连续 30 分钟不操作，都需重新输入密钥</p>
+  </div>
+  <script>
+    const form = document.getElementById('gateForm');
+    const input = document.getElementById('keyInput');
+    const btn = document.getElementById('submitBtn');
+    const err = document.getElementById('errBox');
+    const params = new URLSearchParams(location.search);
+    const next = params.get('next') || '/';
+    const TAB_GATE = 'dh_admin_gate_tab';
+    if (params.get('idle') === '1') {
+      err.textContent = '长时间未操作，已自动退出，请重新登录';
+    }
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.textContent = '';
+      const key = (input.value || '').trim();
+      if (!key) {
+        err.textContent = '请输入密钥';
+        return;
+      }
+      btn.disabled = true;
+      try {
+        const res = await fetch('/api/admin/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ key }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.code !== 0) {
+          err.textContent = data.msg || '密钥错误';
+          btn.disabled = false;
+          input.focus();
+          input.select();
+          return;
+        }
+        try { sessionStorage.setItem(TAB_GATE, '1'); } catch (_) {}
+        location.replace(next.startsWith('/') ? next : '/');
+      } catch (ex) {
+        err.textContent = '网络异常，请重试';
+        btn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
