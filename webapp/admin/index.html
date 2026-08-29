@@ -135,7 +135,7 @@
             <span class="pager-meta" id="worksPagerMeta"></span>
           </div>
           <div class="works-grid" id="worksGrid"></div>
-          <div class="pager" id="worksPager"></div>
+          <div class="pager page-pager" id="worksPager"></div>
         </section>
 
         <!-- 形象库 -->
@@ -155,8 +155,8 @@
                 <p class="hint-text" id="avatarPrivateHint">留空显示全部个人形象；输入用户名可筛选</p>
               </div>
               <div class="media-grid avatar-page-grid" id="avatarGrid"></div>
-              <div class="pager" id="avatarPager"></div>
             </div>
+            <div class="pager page-pager" id="avatarPager"></div>
             <div class="avatars-upload-col panel sticky-panel">
               <h3>上传新形象</h3>
               <p class="hint-text">支持大文件分片上传；已是 25fps 的视频不转码，其他帧率会转成 25fps</p>
@@ -201,39 +201,43 @@
                 <p class="hint-text" id="createPrivateHint">留空显示全部个人形象；输入用户名可筛选</p>
               </div>
               <div class="media-grid avatar-page-grid" id="createAvatarGrid"></div>
-              <div class="pager" id="createAvatarPager"></div>
             </div>
+            <div class="pager page-pager" id="createAvatarPager"></div>
             <div class="avatars-upload-col panel sticky-panel">
-              <h3>创建作品</h3>
-              <p class="hint-text">选择左侧已就绪形象，上传驱动音频后开始合成。质量越高时间越长。</p>
+              <div class="create-panel-head">
+                <h3>创建作品</h3>
+                <p class="hint-text">左侧选形象，填写信息后上传音频即可合成</p>
+              </div>
               <div class="create-preview-stage" id="createPreview">
                 <div class="empty-stage">
-                  <svg width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.5-6 8-6s8 2 8 6"/></svg>
-                  请先选择形象
+                  <svg width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.5-6 8-6s8 2 8 6"/></svg>
+                  <span>请选择目标形象</span>
                 </div>
               </div>
               <form id="taskForm" class="create-task-form">
                 <input type="hidden" name="avatar_identifier" id="pickedAvatar">
-                <div class="field"><label>用户ID</label><input name="username" required placeholder="如：King"></div>
-                <div class="field"><label>作品名称</label><input name="task_name" required placeholder="今日新闻"></div>
-                <div class="field">
-                  <label>合成质量</label>
-                  <div class="quality-steps">
-                    <label class="step"><input type="radio" name="steps" value="20" checked> 标准</label>
-                    <label class="step"><input type="radio" name="steps" value="50"> 高质量</label>
-                    <label class="step"><input type="radio" name="steps" value="80"> 超高质量</label>
-                  </div>
-                  <p class="hint-text">质量越高，嘴型越清晰，合成时间也越长。单卡同时只跑一条。</p>
+                <div class="field-row">
+                  <div class="field"><label>用户ID</label><input name="username" required placeholder="如：King"></div>
+                  <div class="field"><label>作品名称</label><input name="task_name" required placeholder="今日新闻"></div>
                 </div>
                 <div class="field">
+                  <label>合成质量</label>
+                  <div class="quality-steps" role="radiogroup" aria-label="合成质量">
+                    <label class="step"><input type="radio" name="steps" value="20" checked><span class="step-name">标准</span></label>
+                    <label class="step"><input type="radio" name="steps" value="50"><span class="step-name">高质量</span></label>
+                    <label class="step"><input type="radio" name="steps" value="80"><span class="step-name">超高质量</span></label>
+                  </div>
+                  <p class="hint-text">质量越高嘴型越清晰，耗时也更长</p>
+                </div>
+                <div class="field field-audio">
                   <label>驱动音频</label>
                   <label class="file-drop create-audio-drop" id="audioDrop">
                     <input type="file" name="audio" accept="audio/*" required>
                     <div class="icon">🎵</div>
-                    <p id="audioLabel">选择 wav / mp3 音频</p>
+                    <p id="audioLabel">拖拽或点击选择 wav / mp3</p>
                   </label>
                 </div>
-                <button type="submit" class="btn btn-primary" style="width:100%" id="taskSubmit">开始合成</button>
+                <button type="submit" class="btn btn-primary" id="taskSubmit">开始合成</button>
               </form>
             </div>
           </div>

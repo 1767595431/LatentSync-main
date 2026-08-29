@@ -1323,18 +1323,9 @@ function pickAvatarFromCard(id, video, thumb) {
 }
 
 function syncSplitUploadPanelHeight() {
-  const page = document.querySelector('#page-avatars.active, #page-create.active');
-  if (!page) return;
-  const gridId = page.id === 'page-avatars' ? 'avatarGrid' : 'createAvatarGrid';
-  const uploadCol = page.querySelector('.avatars-upload-col');
-  if (!uploadCol) return;
-  const anchor = page.querySelector(`#${gridId} .media-card`) || page.querySelector(`#${gridId} .empty-state.inline`);
-  if (!anchor) {
-    uploadCol.style.minHeight = '';
-    return;
-  }
-  const h = Math.ceil(anchor.getBoundingClientRect().bottom - uploadCol.getBoundingClientRect().top);
-  if (h > 0) uploadCol.style.minHeight = `${h}px`;
+  document.querySelectorAll('#page-avatars .avatars-upload-col, #page-create .avatars-upload-col').forEach((col) => {
+    col.style.minHeight = '';
+  });
 }
 
 function syncAvatarsUploadPanelHeight() {
