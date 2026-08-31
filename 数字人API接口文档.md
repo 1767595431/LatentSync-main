@@ -114,7 +114,7 @@ http://<主机>:8811
 
 只接受以上三个取值。
 
-`result_path`、形象 `preview_video_path` 均为**低码率预览**：保持原分辨率、约 2Mbps、**静音**。原片请用下载接口。
+形象 `preview_video_path` 为低码率预览：原分辨率、约 2Mbps、**静音**。成片 `result_path` 同样为原分辨率、约 2Mbps，但**保留声音**。无损原片请用下载接口。
 
 ### 1.7 素材限制
 
@@ -168,7 +168,7 @@ X-User-Id: u1001
 | POST | `/api/tasks/create` | 创建合成作品 |
 | GET | `/api/tasks/{task_id}` | 查询单个作品（轮询） |
 | POST | `/api/tasks/{task_id}/retry` | 失败/完成后重试 |
-| GET | `/api/tasks/{task_id}/preview` | 成片预览（mp4，低码率） |
+| GET | `/api/tasks/{task_id}/preview` | 成片预览（mp4，低码率，带声音） |
 | GET | `/api/tasks/{task_id}/download` | 成片原片下载 |
 | DELETE | `/api/tasks/{task_id}` | 删除作品 |
 
@@ -550,8 +550,8 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `quality_label` | string | `标准` / `高质量` / `超高质量` |
 | `audio_name` | string | 音频文件名 |
 | `audio_duration` | number | 音频时长（秒） |
-| `remaining_seconds` | number | 预计剩余秒数 |
-| `total_duration_text` | string | 剩余时间文案，如「约 12 分钟」 |
+| `remaining_seconds` | number | 仅 `status=run` 时为预计剩余秒数；排队中为 `null` |
+| `total_duration_text` | string | 仅合成中给出剩余时间文案，如「约 12 分钟」；排队中为空 |
 | `created_at` / `started_at` / `finished_at` | string | 时间 |
 
 原片地址固定为 `/api/tasks/{task_id}/download`，不在 JSON 里单独给出。
@@ -674,7 +674,7 @@ curl -s -X POST "http://127.0.0.1:8811/api/tasks/<作品ID>/retry?username=u1001
 
 使用了**个人形象**的作品必须带请求头 `X-User-Id`。裸 URL、分享链接、`?user_id=` 均无法打开。
 
-成功：HTTP `200`，`Content-Type: video/mp4`。与形象预览相同：原分辨率、约 2Mbps、静音。个人成片带 `Cache-Control: private, no-store`。原片请用 6.6 下载。
+成功：HTTP `200`，`Content-Type: video/mp4`。原分辨率、约 2Mbps、**带声音**（AAC）。个人成片带 `Cache-Control: private, no-store`。无损原片请用 6.6 下载。
 
 | HTTP | `detail` | 场景 |
 |---|---|---|

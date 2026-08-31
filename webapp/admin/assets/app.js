@@ -45,35 +45,7 @@ let selectedWorkIds = new Set();
 let taskLogPollTimer = null;
 let taskLogOpenId = null;
 
-const PAGE_SIZE = { works: 12, avatars: 12 };
-const WORK_CARD_MIN_PX = 300;
-const WORK_GRID_GAP_PX = 22;
-const WORK_CARD_EST_H = 360;
-let lastWorksPageSize = PAGE_SIZE.works;
-
-/** 按作品库网格可用宽高估算每页条数，尽量铺满一屏 */
-function calcWorksPageSize() {
-  const grid = $('#worksGrid');
-  const width = Math.max(
-    280,
-    grid?.clientWidth || (($('.content')?.clientWidth || window.innerWidth) - 48),
-  );
-  const cols = Math.max(
-    1,
-    Math.floor((width + WORK_GRID_GAP_PX) / (WORK_CARD_MIN_PX + WORK_GRID_GAP_PX)),
-  );
-  const topChrome = ($('.topbar')?.offsetHeight || 72) + ($('#worksToolbar')?.offsetHeight || 48) + 160;
-  const availH = Math.max(420, window.innerHeight - topChrome);
-  const rows = Math.max(2, Math.floor((availH + WORK_GRID_GAP_PX) / (WORK_CARD_EST_H + WORK_GRID_GAP_PX)));
-  // API 上限 100；至少两行满列
-  return Math.max(cols * 2, Math.min(100, cols * rows));
-}
-
-function worksPageSize() {
-  const n = calcWorksPageSize();
-  PAGE_SIZE.works = n;
-  return n;
-}
+const PAGE_SIZE = { works: 15, avatars: 15 };
 
 const HOME_FILTERS = {
   'avatar-public': { label: '公共形象' },
@@ -249,8 +221,7 @@ async function fetchAvatarsPage(page, opts = {}) {
 
 async function fetchWorksPage(page) {
   const p = page ?? worksPage;
-  const pageSize = worksPageSize();
-  lastWorksPageSize = pageSize;
+  const pageSize = PAGE_SIZE.works;
   const params = new URLSearchParams({
     page: String(p),
     page_size: String(pageSize),
@@ -402,7 +373,7 @@ async function refreshAvatarCounts() {
   }
 }
 
-async function loadAvatarsData({ animate = true } = {}) {
+async function loadAvatarsData({ animate = false } = {}) {
   await refreshAvatarCounts();
   if (currentPage === 'avatars') await renderAvatars({ animate });
   else if (currentPage === 'create') await renderCreateAvatars({ animate });
@@ -444,7 +415,7 @@ function renderStatsRow({ animate = true } = {}) {
   row.innerHTML = pills.map(([key, label, val, cls]) =>
     `<button type="button" class="stat-pill clickable ${cls}${homeFilter === key ? ' active' : ''}" data-home-filter="${key}"><div class="v">${val}</div><div class="l">${label}</div></button>`
   ).join('');
-  if (FX?.shouldAnimate(animate)) FX.revealChildren(row, '.stat-pill');
+  if (FX?.shouldAnimate(animate)) FX.revealChildren(row, '.stat-pill', { animation: 'zoomIn', duration: 560, stagger: 40 });
 }
 
 function canPatchTaskCards(container, items) {
@@ -563,6 +534,9 @@ function patchWorkCard(card, t) {
   const pct = Math.max(0, Math.min(100, t.progress ?? 0));
   const msg = t.progress_message || t.error_message || '';
   card.dataset.status = t.status || '';
+  card.classList.toggle('is-selected', selectedWorkIds.has(t.task_id));
+  const check = card.querySelector('[data-select-work]');
+  if (check) check.checked = selectedWorkIds.has(t.task_id);
 
   const tag = card.querySelector('.work-meta .tag');
   if (tag) {
@@ -647,40 +621,38 @@ function patchWorkCard(card, t) {
   }
 }
 
-function renderHomeDefaultSections({ animate = true } = {}) {
+async function renderHomeDefaultSections({ animate = true } = {}) {
   const done = homeTasksSnapshot.filter((t) => t.status === 'done').slice(0, 12);
   const running = homeTasksSnapshot.filter((t) => t.status === 'run' || t.status === 'wait').slice(0, 8);
   const recentEl = $('#recentWorks');
   const activeEl = $('#activeWorks');
   const avatarsEl = $('#homeAvatars');
-  if (!animate && canPatchTaskCards(recentEl, done)) {
+  if (canPatchTaskCards(recentEl, done) && done.length) {
     [...recentEl.querySelectorAll('.media-card[data-task-id]')].forEach((card, i) => patchMediaCard(card, done[i], true));
   } else {
-    recentEl.innerHTML = done.length
+    const html = done.length
       ? done.map((t) => renderMediaCard(t, true)).join('')
       : '<div class="empty-state" style="padding:40px;min-width:280px"><div class="ico">🎬</div><h3>暂无成品</h3><p>完成合成后将在此展示</p></div>';
+    await paintGrid(recentEl, html, animate);
   }
-  if (!animate && canPatchTaskCards(activeEl, running)) {
+  if (canPatchTaskCards(activeEl, running) && running.length) {
     [...activeEl.querySelectorAll('.media-card[data-task-id]')].forEach((card, i) => patchMediaCard(card, running[i], false));
   } else {
-    activeEl.innerHTML = running.length
+    const html = running.length
       ? running.map((t) => renderMediaCard(t, false)).join('')
       : '<div class="empty-state" style="padding:40px;min-width:280px"><p>当前没有进行中的任务</p></div>';
+    await paintGrid(activeEl, html, animate);
   }
   const readyAvatars = avatarsList.filter(isAvatarReady).slice(0, 10);
-  if (!animate && canPatchAvatarGrid(avatarsEl, readyAvatars)) {
+  if (canPatchAvatarGrid(avatarsEl, readyAvatars) && readyAvatars.length) {
     patchAvatarGridCards(avatarsEl, readyAvatars, { compact: true });
-  } else if (!animate && !readyAvatars.length && avatarsEl.querySelector('.empty-state') && !avatarsEl.querySelector('[data-avatar-id]')) {
+  } else if (!readyAvatars.length && avatarsEl.querySelector('.empty-state') && !avatarsEl.querySelector('[data-avatar-id]')) {
     /* keep empty */
   } else {
-    avatarsEl.innerHTML = readyAvatars.length
+    const html = readyAvatars.length
       ? readyAvatars.map((a) => renderAvatarCard(a, { compact: true })).join('')
       : '<div class="empty-state" style="padding:40px"><p>暂无可用形象</p></div>';
-  }
-  if (FX?.shouldAnimate(animate)) {
-    FX.revealChildren(recentEl);
-    FX.revealChildren(activeEl);
-    FX.revealChildren(avatarsEl);
+    await paintGrid(avatarsEl, html, animate);
   }
 }
 
@@ -759,11 +731,11 @@ async function getHomeFilteredModel() {
 
 function setHomeFilter(key) {
   homeFilter = homeFilter === key ? null : key;
-  renderHomeContent();
+  renderHomeContent({ animate: true });
 }
 
 async function renderHomeContent({ animate = true } = {}) {
-  renderStatsRow({ animate });
+  renderStatsRow({ animate: false });
   const bar = $('#homeFilterBar');
   const defaultView = $('#homeDefaultView');
   const filteredView = $('#homeFilteredView');
@@ -773,7 +745,7 @@ async function renderHomeContent({ animate = true } = {}) {
     filteredView?.classList.add('hidden');
     const readyData = await fetchAvatarsPage(1, { bake_status: 'ready', page_size: 10 });
     avatarsList = readyData?.items || [];
-    renderHomeDefaultSections({ animate });
+    await renderHomeDefaultSections({ animate });
     return;
   }
   bar?.classList.remove('hidden');
@@ -786,7 +758,7 @@ async function renderHomeContent({ animate = true } = {}) {
   const ids = (model.items || []).map((it) => it.task_id || it.identifier).join(',');
   const staticKey = `${homeFilter}|${model.kind}|${ids}|${model.search || ''}`;
   const grid = filteredView?.querySelector('.home-filter-grid');
-  if (!animate && filteredView?.dataset.staticKey === staticKey) {
+  if (filteredView?.dataset.staticKey === staticKey) {
     if (model.kind === 'work' && model.items.length && grid && canPatchTaskCards(grid, model.items)) {
       [...grid.querySelectorAll('.work-card[data-task-id], .media-card[data-task-id]')].forEach((card, i) => {
         const item = model.items[i];
@@ -803,11 +775,7 @@ async function renderHomeContent({ animate = true } = {}) {
   }
   if (filteredView) {
     filteredView.dataset.staticKey = staticKey;
-    filteredView.innerHTML = model.html;
-  }
-  if (FX?.shouldAnimate(animate)) {
-    FX.reveal($('#homeFilterBar'), 'fadeInDown', 300);
-    FX.revealChildren(filteredView);
+    await paintGrid(filteredView, model.html, animate);
   }
 }
 
@@ -871,6 +839,7 @@ function resultPoster(t) {
 }
 
 function resultVideoFull(t) {
+  if (t?.task_id) return mediaUrl(`/api/tasks/${t.task_id}/download`);
   if (t?.result_path) return mediaUrl(t.result_path);
   return '';
 }
@@ -905,7 +874,7 @@ async function go(page) {
   const meta = PAGES[page] || { title: page, desc: '' };
   $('#pageTitle').textContent = meta.title;
   $('#pageDesc').textContent = meta.desc;
-  refreshPage();
+  refreshPage({ animate: !same });
   setupPolling();
   if (isMobileLayout() && !same) {
     window.scrollTo(0, 0);
@@ -913,17 +882,14 @@ async function go(page) {
   const next = $(`#page-${page}`);
   if (!same && next && FX?.shouldAnimate(true)) {
     FX.reveal(next, 'fadeIn', 360);
-    FX.reveal($('.topbar'), 'fadeInDown', 300);
   }
 }
 
-function refreshPage() {
-  if (currentPage === 'home') refreshHome(false);
-  if (currentPage === 'works') renderWorks();
-  if (currentPage === 'avatars') renderAvatars();
-  if (currentPage === 'create') {
-    renderAvatarPicker();
-  }
+function refreshPage({ animate = false } = {}) {
+  if (currentPage === 'home') refreshHome(false, { animate });
+  if (currentPage === 'works') renderWorks({ animate });
+  if (currentPage === 'avatars') renderAvatars({ animate });
+  if (currentPage === 'create') renderCreateAvatars({ animate });
   if (currentPage === 'settings') renderSettings();
   checkReady();
 }
@@ -1092,7 +1058,7 @@ async function enrichTaskProgress(t) {
   } catch { /* ignore */ }
 }
 
-async function refreshHome(showToast = true) {
+async function refreshHome(showToast = true, { animate = false } = {}) {
   try {
     const { data: r } = await api('/api/system/status');
     if (r.code === 0) {
@@ -1100,7 +1066,7 @@ async function refreshHome(showToast = true) {
       scheduleBakePoll();
     }
   } catch { /* ignore */ }
-  await loadTasksAndRender();
+  await loadTasksAndRender(!animate);
   if (showToast) toast('已刷新', 'success');
 }
 
@@ -1192,6 +1158,17 @@ function updateWorksToolbar(pageItems) {
   }
 }
 
+function syncWorkSelection() {
+  $$('#worksGrid .work-card[data-task-id]').forEach((card) => {
+    const id = card.dataset.taskId;
+    const on = selectedWorkIds.has(id);
+    card.classList.toggle('is-selected', on);
+    const cb = card.querySelector('[data-select-work]');
+    if (cb) cb.checked = on;
+  });
+  updateWorksToolbar(worksPageItems);
+}
+
 async function renderWorks({ animate = true } = {}) {
   const userQ = ($('#workUserSearch')?.value || '').trim();
   const data = await fetchWorksPage();
@@ -1205,31 +1182,23 @@ async function renderWorks({ animate = true } = {}) {
     const emptyMsg = userQ
       ? `<div class="empty-state"><div class="ico">📽</div><h3>该用户暂无作品</h3><p>用户标识「${esc(userQ)}」下没有匹配的任务</p></div>`
       : `<div class="empty-state"><div class="ico">📽</div><h3>暂无作品</h3><p>去「创建」页开始第一个合成吧</p></div>`;
-    if (animate || !grid.querySelector('.empty-state') || grid.querySelector('[data-task-id]')) {
-      grid.innerHTML = emptyMsg;
+    if (!grid.querySelector('.empty-state') || grid.querySelector('[data-task-id]')) {
+      await paintGrid(grid, emptyMsg, animate);
     }
     renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
-    if (FX?.shouldAnimate(animate)) {
-      FX.revealChildren(grid);
-      FX.reveal($('#worksPager'), 'fadeIn', 300);
-    }
     return;
   }
   toolbar?.classList.remove('hidden');
-  if (!animate && canPatchTaskCards(grid, items)) {
+  if (canPatchTaskCards(grid, items)) {
     [...grid.querySelectorAll('.work-card[data-task-id]')].forEach((card, i) => {
       patchWorkCard(card, items[i]);
     });
   } else {
-    grid.innerHTML = items.map((t) => renderWorkCard(t, { selectable: true, selected: selectedWorkIds.has(t.task_id) })).join('');
+    const html = items.map((t) => renderWorkCard(t, { selectable: true, selected: selectedWorkIds.has(t.task_id) })).join('');
+    await paintGrid(grid, html, animate);
   }
   renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
   updateWorksToolbar(items);
-  if (FX?.shouldAnimate(animate)) {
-    FX.revealChildren(grid);
-    FX.reveal($('#worksPager'), 'fadeIn', 300);
-    FX.reveal($('#worksToolbar'), 'fadeIn', 300);
-  }
 }
 
 async function batchDeleteWorks() {
@@ -1246,7 +1215,7 @@ async function batchDeleteWorks() {
     } else fail++;
   }
   toast(`已删除 ${ok} 个${fail ? `，失败 ${fail} 个` : ''}`, fail ? 'error' : 'success');
-  await loadTasksAndRender();
+  await loadTasksAndRender(true);
 }
 
 function renderAvatarBakeProgress(a) {
@@ -1270,9 +1239,15 @@ function renderAvatarBakeProgress(a) {
 function canPatchAvatarGrid(grid, items) {
   if (!grid) return false;
   const cards = [...grid.querySelectorAll('.media-card[data-avatar-id]')];
-  if (!items.length) return cards.length === 0;
+  if (!items.length) return cards.length === 0 && !!grid.querySelector('.empty-state');
   if (cards.length !== items.length) return false;
   return items.every((a, i) => cards[i].dataset.avatarId === a.identifier);
+}
+
+async function paintGrid(grid, html, animate) {
+  if (!grid) return;
+  if (FX?.swapChildren) await FX.swapChildren(grid, html, animate);
+  else grid.innerHTML = html;
 }
 
 function patchAvatarGridCards(grid, items, { pickMode = false } = {}) {
@@ -1451,24 +1426,21 @@ async function renderCreateAvatars({ animate = true } = {}) {
   const items = data.items || [];
   const { page, pages, total } = avatarsPageMeta;
 
-  if (!animate && canPatchAvatarGrid(grid, items)) {
+  if (canPatchAvatarGrid(grid, items) && items.length) {
     patchAvatarGridCards(grid, items, { pickMode: true });
   } else if (avatarTab === 'public') {
-    grid.innerHTML = items.length
+    const html = items.length
       ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
       : '<div class="empty-state inline"><p>暂无可用公共形象，请先在形象库上传并完成转码</p></div>';
+    await paintGrid(grid, html, animate);
   } else {
-    grid.innerHTML = items.length
+    const html = items.length
       ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
       : `<div class="empty-state inline"><p>${privQ ? '该用户暂无可用个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
+    await paintGrid(grid, html, animate);
   }
   renderPager($('#createAvatarPager'), page, pages, total, PAGE_SIZE.avatars);
   syncAvatarsUploadPanelHeight();
-  if (animate && FX?.shouldAnimate(true)) {
-    FX.revealChildren(grid);
-    FX.reveal($('#createAvatarPager'), 'fadeIn', 300);
-    if (filterWrap && avatarTab === 'private') FX.reveal(filterWrap, 'fadeInDown', 280);
-  }
 }
 
 function pickAvatarFromCard(id, video, thumb) {
@@ -1479,8 +1451,9 @@ function pickAvatarFromCard(id, video, thumb) {
     return;
   }
   selectAvatar(id, video, thumb);
-  renderCreateAvatars();
-  syncAvatarsUploadPanelHeight();
+  $$('#createAvatarGrid .media-card[data-pick-id]').forEach((el) => {
+    el.classList.toggle('is-selected', el.dataset.pickId === id);
+  });
 }
 
 function syncSplitUploadPanelHeight() {
@@ -1511,41 +1484,41 @@ async function renderAvatars({ animate = true } = {}) {
   const items = data.items || [];
   const { page, pages, total } = avatarsPageMeta;
 
-  if (!animate && canPatchAvatarGrid(grid, items)) {
+  if (canPatchAvatarGrid(grid, items) && items.length) {
     patchAvatarGridCards(grid, items);
   } else if (avatarTab === 'public') {
-    grid.innerHTML = items.length
+    const html = items.length
       ? items.map((a) => renderAvatarCard(a)).join('')
       : '<div class="empty-state inline"><p>暂无公共形象，点击「上传形象」</p></div>';
+    await paintGrid(grid, html, animate);
   } else {
-    grid.innerHTML = items.length
+    const html = items.length
       ? items.map((a) => renderAvatarCard(a)).join('')
       : `<div class="empty-state inline"><p>${privQ ? '未找到该用户的个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
+    await paintGrid(grid, html, animate);
   }
   renderPager($('#avatarPager'), page, pages, total, PAGE_SIZE.avatars);
   syncAvatarsUploadPanelHeight();
-  if (animate && FX?.shouldAnimate(true)) {
-    FX.revealChildren(grid);
-    FX.reveal($('#avatarPager'), 'fadeIn', 300);
-    if (filterWrap && avatarTab === 'private') FX.reveal(filterWrap, 'fadeInDown', 280);
-  }
   scheduleBakePoll();
 }
 
 function renderAvatarPicker() {
-  renderCreateAvatars();
+  renderCreateAvatars({ animate: false });
 }
 
 function selectAvatar(id, video, thumb) {
+  const stage = $('#createPreview');
+  const already = pickedAvatarId === id;
   pickedAvatarId = id;
   $('#pickedAvatar').value = id;
-  const stage = $('#createPreview');
+  if (!stage) return;
   if (!video) {
-    stage.innerHTML = '<div class="empty-stage"><p>转码完成后可预览</p></div>';
+    if (!already) stage.innerHTML = '<div class="empty-stage"><p>转码完成后可预览</p></div>';
     return;
   }
+  if (already && stage.querySelector('video')) return;
   stage.innerHTML = `<video src="${esc(video)}" autoplay muted loop playsinline poster="${esc(thumb)}"></video>`;
-  FX?.reveal(stage, 'fadeIn', 360);
+  FX?.reveal(stage, 'zoomIn', 600);
 }
 
 async function handleTaskAction(e) {
@@ -1562,18 +1535,18 @@ async function handleTaskAction(e) {
   if (stop) {
     const { data: r } = await api(`/api/tasks/${stop}/stop`, { method: 'POST' });
     toast(r.msg || '已停止', r.code === 0 ? 'success' : 'error');
-    loadTasksAndRender();
+    loadTasksAndRender(true);
   }
   if (retry) {
     const { data: r } = await api(`/api/tasks/${retry}/retry`, { method: 'POST' });
     toast(r.msg || '已重试', r.code === 0 ? 'success' : 'error');
-    loadTasksAndRender();
+    loadTasksAndRender(true);
   }
   if (del && confirm('删除此作品？')) {
     const { data: r } = await api(`/api/tasks/${del}`, { method: 'DELETE' });
     toast(r.msg || '已删除', r.code === 0 ? 'success' : 'error');
     selectedWorkIds.delete(del);
-    loadTasksAndRender();
+    loadTasksAndRender(true);
   }
 }
 
@@ -1666,15 +1639,25 @@ function setUpDock(open) {
 
 function openUploadModal() {
   syncUpTypeUi();
-  $('#upModal')?.classList.remove('hidden');
-  $('#upModal')?.setAttribute('aria-hidden', 'false');
+  const overlay = $('#upModal');
+  const inner = overlay?.querySelector('.up-dialog');
+  overlay?.classList.remove('hidden');
+  overlay?.setAttribute('aria-hidden', 'false');
   document.body.style.overflow = 'hidden';
   renderUpDrafts();
+  requestAnimationFrame(() => {
+    if (inner) FX?.run(inner, 'zoomIn', 700);
+  });
 }
 
-function closeUploadModal() {
-  $('#upModal')?.classList.add('hidden');
-  $('#upModal')?.setAttribute('aria-hidden', 'true');
+async function closeUploadModal() {
+  const overlay = $('#upModal');
+  const inner = overlay?.querySelector('.up-dialog');
+  if (inner && FX?.shouldAnimate(true)) {
+    await FX.run(inner, 'zoomOut', 480, 0, { persist: true });
+  }
+  overlay?.classList.add('hidden');
+  overlay?.setAttribute('aria-hidden', 'true');
   document.body.style.overflow = '';
 }
 
@@ -2050,7 +2033,7 @@ $('#taskForm')?.addEventListener('submit', async (e) => {
     toast('已开始合成，可在作品库查看进度', 'success');
     form.reset();
     $('#audioLabel').textContent = '选择 wav / mp3 音频';
-    await loadTasksAndRender();
+    await loadTasksAndRender(true);
     go('works');
   } catch (err) {
     toast(err.message, 'error');
@@ -2232,36 +2215,35 @@ document.addEventListener('keydown', (e) => {
 $$('.nav-item').forEach((b) => b.addEventListener('click', () => go(b.dataset.page)));
 $$('[data-goto]').forEach((b) => b.addEventListener('click', () => go(b.dataset.goto)));
 $('#btnRefresh')?.addEventListener('click', () => refreshPage());
-$('#workSearch')?.addEventListener('input', () => { worksPage = 1; renderWorks(); });
-$('#workUserSearch')?.addEventListener('input', () => { worksPage = 1; renderWorks(); });
-$('#avatarPrivateSearch')?.addEventListener('input', () => { avatarPrivatePage = 1; renderAvatars(); });
+$('#workSearch')?.addEventListener('input', () => { worksPage = 1; renderWorks({ animate: false }); });
+$('#workUserSearch')?.addEventListener('input', () => { worksPage = 1; renderWorks({ animate: false }); });
+$('#avatarPrivateSearch')?.addEventListener('input', () => { avatarPrivatePage = 1; renderAvatars({ animate: false }); });
 $$('#avatarTypeTabs .tab, #createAvatarTypeTabs .tab').forEach((tab) => {
   tab.addEventListener('click', () => {
     const next = tab.dataset.avatarTab;
-    if (next !== avatarTab) {
-      if (next === 'public') avatarPublicPage = 1;
-      else avatarPrivatePage = 1;
-    }
+    if (next === avatarTab) return;
+    if (next === 'public') avatarPublicPage = 1;
+    else avatarPrivatePage = 1;
     avatarTab = next;
-    renderAvatars();
-    renderCreateAvatars();
+    if (currentPage === 'avatars') renderAvatars();
+    else if (currentPage === 'create') renderCreateAvatars();
   });
 });
-$('#createPrivateSearch')?.addEventListener('input', () => { avatarPrivatePage = 1; renderCreateAvatars(); });
-$('#homeFilterClear')?.addEventListener('click', () => { homeFilter = null; renderHomeContent(); });
+$('#createPrivateSearch')?.addEventListener('input', () => { avatarPrivatePage = 1; renderCreateAvatars({ animate: false }); });
+$('#homeFilterClear')?.addEventListener('click', () => { homeFilter = null; renderHomeContent({ animate: true }); });
 $('#statRow')?.addEventListener('click', (e) => {
   const btn = e.target.closest('[data-home-filter]');
   if (btn) setHomeFilter(btn.dataset.homeFilter);
 });
 $('#homeFilteredView')?.addEventListener('input', (e) => {
-  if (e.target.id === 'homePrivateSearch') renderHomeContent();
+  if (e.target.id === 'homePrivateSearch') renderHomeContent({ animate: false });
 });
 $('#worksSelectAll')?.addEventListener('change', (e) => {
   worksPageItems.forEach((t) => {
     if (e.target.checked) selectedWorkIds.add(t.task_id);
     else selectedWorkIds.delete(t.task_id);
   });
-  renderWorks();
+  syncWorkSelection();
 });
 $('#worksBatchDel')?.addEventListener('click', () => batchDeleteWorks());
 $('#worksPager')?.addEventListener('click', (e) => {
@@ -2298,29 +2280,84 @@ $('#createAvatarGrid')?.addEventListener('click', (e) => {
 
 $$('#workTabs .tab').forEach((tab) => {
   tab.addEventListener('click', () => {
+    const next = tab.dataset.filter;
+    if (next === workFilter) return;
     $$('#workTabs .tab').forEach((t) => t.classList.remove('active'));
     tab.classList.add('active');
-    workFilter = tab.dataset.filter;
+    workFilter = next;
     worksPage = 1;
     selectedWorkIds.clear();
     renderWorks();
   });
 });
 
-document.querySelector('#audioDrop input')?.addEventListener('change', async (e) => {
-  const f = e.target.files[0];
-  if (!f) {
-    $('#audioLabel').textContent = '选择 wav / mp3 音频';
+function isFileDrag(e) {
+  return Array.from(e.dataTransfer?.types || []).includes('Files');
+}
+
+async function applyAudioFile(file, input) {
+  const el = input || document.querySelector('#audioDrop input');
+  const label = $('#audioLabel');
+  if (!el) return;
+  if (!file) {
+    el.value = '';
+    if (label) label.textContent = '拖拽或点击选择 wav / mp3';
     return;
   }
   try {
-    const d = await assertFileWithinLimit(f, 'audio');
-    $('#audioLabel').textContent = `${f.name}（${formatDurationCn(d)}）`;
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    el.files = dt.files;
+  } catch (_) {
+    /* some browsers only allow files via the picker */
+  }
+  try {
+    const d = await assertFileWithinLimit(file, 'audio');
+    if (label) label.textContent = `${file.name}（${formatDurationCn(d)}）`;
   } catch (err) {
     toast(err.message, 'error');
-    e.target.value = '';
-    $('#audioLabel').textContent = '选择 wav / mp3 音频';
+    el.value = '';
+    if (label) label.textContent = '拖拽或点击选择 wav / mp3';
   }
+}
+
+document.addEventListener('dragover', (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+}, true);
+
+document.addEventListener('drop', (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+}, true);
+
+const audioDrop = $('#audioDrop');
+const audioInput = document.querySelector('#audioDrop input');
+audioInput?.addEventListener('change', async (e) => {
+  await applyAudioFile(e.target.files[0], e.target);
+});
+audioDrop?.addEventListener('dragenter', (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  audioDrop.classList.add('drag');
+});
+audioDrop?.addEventListener('dragover', (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+  audioDrop.classList.add('drag');
+});
+audioDrop?.addEventListener('dragleave', (e) => {
+  if (e.relatedTarget && audioDrop.contains(e.relatedTarget)) return;
+  audioDrop.classList.remove('drag');
+});
+audioDrop?.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  audioDrop.classList.remove('drag');
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+  await applyAudioFile(file, audioInput);
 });
 
 function renderSettings() {
@@ -2361,7 +2398,7 @@ async function init() {
       const { data: r } = await api(`/api/avatars/${encodeURIComponent(rebake)}/rebake`, { method: 'POST' });
       toast(r.msg || '已提交', r.code === 0 ? 'success' : 'error');
       await loadAvatarsData();
-      if (currentPage === 'home') await renderHomeContent();
+      if (currentPage === 'home') await renderHomeContent({ animate: false });
       return;
     }
     const use = e.target.dataset.use;
@@ -2392,7 +2429,7 @@ async function init() {
       const id = e.target.dataset.selectWork;
       if (e.target.checked) selectedWorkIds.add(id);
       else selectedWorkIds.delete(id);
-      renderWorks();
+      syncWorkSelection();
     }
   });
 
@@ -2400,18 +2437,9 @@ async function init() {
   await loadTasksAndRender(true);
   bindUploadUi();
   let syncUploadPanelTimer;
-  let worksResizeTimer;
   window.addEventListener('resize', () => {
     clearTimeout(syncUploadPanelTimer);
     syncUploadPanelTimer = setTimeout(syncAvatarsUploadPanelHeight, 120);
-    clearTimeout(worksResizeTimer);
-    worksResizeTimer = setTimeout(() => {
-      if (currentPage !== 'works') return;
-      const next = calcWorksPageSize();
-      if (next === lastWorksPageSize) return;
-      worksPage = 1;
-      renderWorks({ animate: false });
-    }, 180);
   });
   currentPage = '';
   startIdleWatch();

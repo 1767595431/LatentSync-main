@@ -144,7 +144,6 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         key=lambda j: j.get("created_at") or "",
     )
 
-    running_remain = 0.0
     if running:
         r = running[0]
         remain = running_remaining(
@@ -158,20 +157,15 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             progress_updated_at=r.get("progress_updated_at"),
         )
         r["remaining_seconds"] = None if remain is None else int(round(remain))
-        running_remain = float(r["remaining_seconds"] or 0)
         if (r.get("stage") in {None, "", "loading"}) and not r.get("current_chunk"):
             started = parse_iso(r.get("started_at"))
             if started:
                 elapsed = (now_utc() - started).total_seconds()
                 r["progress_percent"] = round(min(8.0, 8.0 * elapsed / LOAD_OVERHEAD_SEC), 1)
 
-    wait = running_remain
     for idx, job in enumerate(queued, start=1):
-        own = job.get("estimated_seconds")
         job["queue_position"] = idx
-        total_wait = wait + float(own or 0)
-        job["remaining_seconds"] = int(round(total_wait)) if (wait or own) else None
-        wait += float(own or 0)
+        job["remaining_seconds"] = None
 
     for job in items:
         if job.get("status") == "done":
@@ -181,9 +175,14 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         elif job.get("status") == "failed":
             job["remaining_seconds"] = 0
         elif job.get("status") == "queued":
-            job["progress_percent"] = job.get("progress_percent") or 0
+            job["progress_percent"] = 0
             job["stage"] = "queued"
-        job["remaining_text"] = format_seconds(job.get("remaining_seconds"))
+            job["remaining_seconds"] = None
+        job["remaining_text"] = (
+            None
+            if job.get("status") != "running"
+            else format_seconds(job.get("remaining_seconds"))
+        )
         if job.get("status") in {"done", "failed"}:
             job["remaining_text"] = None
         job["progress_text"] = _progress_text(job)
@@ -198,9 +197,6 @@ def _progress_text(job: dict[str, Any]) -> str:
     if status == "failed":
         return job.get("error") or "失败"
     if status == "queued":
-        pos = job.get("queue_position")
-        if pos:
-            return f"排队第 {pos} 位"
         return "排队中"
     cur, total = job.get("current_chunk"), job.get("total_chunks")
     pct = job.get("progress_percent")

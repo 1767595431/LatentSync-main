@@ -30,6 +30,7 @@ from .gpu_runtime import (
     write_status,
 )
 from .media import ensure_preview as write_preview_mp4, ffmpeg_preview_video, preview_is_current
+from .progress import parse_job_line
 
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
@@ -97,14 +98,78 @@ def _adopt_running_inference() -> set[str]:
     return adopted
 
 
+def _load_job(job_id: str) -> Optional[dict]:
+    with db.db() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _catch_up_job_log(log_path: Path, job: dict) -> int:
+    """Parse recent tqdm lines into DB. Returns size to keep following from."""
+    try:
+        size = log_path.stat().st_size
+    except OSError:
+        return 0
+    start = max(0, size - 65536)
+    try:
+        with open(log_path, "rb") as rf:
+            rf.seek(start)
+            if start:
+                rf.readline()
+            data = rf.read().decode("utf-8", errors="replace")
+    except OSError:
+        return size
+    _consume_progress_buf(data.replace("\r", "\n") + "\n", job)
+    return size
+
+
+def _follow_job_log(pid: int, log_path: Path, start_off: int, job: dict) -> None:
+    buf = ""
+    offset = start_off
+    while True:
+        try:
+            with open(log_path, "rb") as rf:
+                rf.seek(offset)
+                while True:
+                    chunk = rf.read(4096)
+                    if chunk:
+                        offset += len(chunk)
+                        buf += chunk.decode("utf-8", errors="replace")
+                        buf = _consume_progress_buf(buf, job)
+                        continue
+                    if not _pid_alive(pid):
+                        extra = rf.read()
+                        if extra:
+                            buf += extra.decode("utf-8", errors="replace")
+                            _consume_progress_buf(buf, job)
+                        return
+                    time.sleep(0.15)
+        except FileNotFoundError:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.3)
+
+
 def _watch_adopted(pid: int, gpu_id: int, job_id: Optional[str]) -> None:
     try:
-        while True:
-            try:
-                os.kill(pid, 0)
-            except OSError:
-                break
-            time.sleep(1)
+        job = _load_job(job_id) if job_id else None
+        if not job and job_id:
+            job = {"id": job_id, "steps": 30}
+        log_path = STORAGE / "jobs" / job_id / "inference.log" if job_id else None
+        if job and log_path:
+            start_off = _catch_up_job_log(log_path, job) if log_path.exists() else 0
+            _follow_job_log(pid, log_path, start_off, job)
+        else:
+            while _pid_alive(pid):
+                time.sleep(1)
         if not job_id:
             return
         output_path = STORAGE / "jobs" / job_id / "output.mp4"
@@ -319,7 +384,7 @@ def ensure_preview(character_id: str) -> None:
     if not video or not video.exists():
         return
     preview_out = Path(char["preview_path"]) if char.get("preview_path") else video.parent / "preview.mp4"
-    if preview_is_current(preview_out):
+    if preview_is_current(preview_out, need_audio=False):
         with db.db() as conn:
             conn.execute(
                 "UPDATE characters SET preview_path = ? WHERE id = ? AND (preview_path IS NULL OR preview_path = '')",
@@ -431,7 +496,7 @@ def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
 
 
 def _ffmpeg_preview_video(src: Path, dst: Path) -> None:
-    ffmpeg_preview_video(src, dst)
+    ffmpeg_preview_video(src, dst, silent=True)
 
 
 def _probe(path: Path) -> dict:
@@ -738,7 +803,10 @@ def _consume_progress_buf(buf: str, job: dict) -> str:
             return buf[-200:] if len(buf) > 800 else buf
         i = min(cuts)
         line, buf = buf[:i], buf[i + 1 :]
-        fields = parse_job_line(line, steps=int(job.get("steps") or 30))
+        try:
+            fields = parse_job_line(line, steps=int(job.get("steps") or 30))
+        except Exception:
+            continue
         if fields:
             _update_job_progress(job["id"], fields)
 

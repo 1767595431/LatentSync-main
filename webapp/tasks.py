@@ -40,7 +40,17 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
     preview = f"/api/tasks/{tid}/preview" if done else ""
     download = f"/api/tasks/{tid}/download" if done else ""
     steps = int(job.get("steps") or DEFAULT_STEPS)
-    remain = job.get("remaining_text") or format_seconds(job.get("remaining_seconds"))
+    remain = None
+    remaining = None
+    if status == "run":
+        remaining = job.get("remaining_seconds")
+        remain = job.get("remaining_text") or format_seconds(remaining)
+    elif status == "wait":
+        remaining = None
+        remain = None
+    else:
+        remaining = 0 if status in {"done", "error"} else job.get("remaining_seconds")
+        remain = None
     return {
         "task_id": tid,
         "task_name": job.get("task_name") or job.get("audio_name") or tid,
@@ -66,7 +76,7 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
         "quality_label": quality_label(steps),
         "audio_name": job.get("audio_name"),
         "audio_duration": job.get("audio_duration"),
-        "remaining_seconds": job.get("remaining_seconds"),
+        "remaining_seconds": remaining,
         "total_duration_text": remain,
     }
 

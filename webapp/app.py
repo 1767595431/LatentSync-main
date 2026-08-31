@@ -1326,7 +1326,7 @@ def _asset_query(name: str) -> str:
 
 def _inject_base(html: str) -> str:
     script = f"<script>{_BASE_JS}</script>"
-    for name in ("style.css", "app.js", "fx.js"):
+    for name in ("vendor/animate.min.css", "style.css", "app.js", "fx.js"):
         token = f"admin/assets/{name}"
         html = html.replace(token, f"{token}?v={_asset_query(name)}", 1)
     if "<!--APP_BASE-->" in html:
