@@ -1,12 +1,32 @@
 import json
 import math
+import re
+import secrets
 import shutil
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 from .config import STORAGE
 
+UPLOAD_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+CHUNK_TTL_SECONDS = 24 * 3600
+_PURGE_MIN_INTERVAL = 60
+_last_purge_at = 0.0
+
 AVATAR_TYPES = ("public", "private")
+CHAR_ID_LEN = 8
+
+
+def new_character_id(conn) -> str:
+    for _ in range(64):
+        cid = secrets.token_hex(CHAR_ID_LEN // 2)
+        if conn.execute("SELECT 1 FROM characters WHERE id = ?", (cid,)).fetchone() is None:
+            return cid
+    raise RuntimeError("无法生成形象ID")
+
+
 BAKE_MAP = {
     "ready": "ready",
     "queued": "processing",
@@ -170,13 +190,27 @@ def paginate(items: list, page: int, page_size: int) -> dict:
     }
 
 
+def parse_upload_id(raw: Optional[str]) -> str:
+    uid = (raw or "").strip().lower()
+    if not UPLOAD_ID_RE.fullmatch(uid):
+        raise FileNotFoundError("上传任务不存在")
+    return uid
+
+
+def chunk_dir(upload_id: str) -> Path:
+    return STORAGE / "chunks" / parse_upload_id(upload_id)
+
+
 def upload_meta_path(upload_id: str) -> Path:
-    return STORAGE / "chunks" / upload_id / "meta.json"
+    return chunk_dir(upload_id) / "meta.json"
 
 
-def write_upload_meta(upload_id: str, data: dict) -> None:
+def write_upload_meta(upload_id: str, data: dict, *, create: bool = False) -> None:
     path = upload_meta_path(upload_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if create:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not path.is_file():
+        raise FileNotFoundError("上传任务不存在")
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
@@ -187,18 +221,154 @@ def read_upload_meta(upload_id: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def discard_upload_chunks(upload_id: str) -> bool:
+    """Remove leftover parts for one session. Idempotent."""
+    try:
+        path = chunk_dir(upload_id)
+    except FileNotFoundError:
+        return False
+    if not path.exists():
+        return False
+    shutil.rmtree(path, ignore_errors=True)
+    return True
+
+
+def abort_upload(upload_id: str) -> None:
+    """Cancel an unfinished upload and drop its chunks + unfinished DB row."""
+    uid = parse_upload_id(upload_id)
+    discard_upload_chunks(uid)
+    from . import db
+
+    with db.db() as conn:
+        conn.execute("DELETE FROM uploads WHERE id = ? AND status != ?", (uid, "ready"))
+
+
+def purge_character_files(character_id: str, source_path: Optional[str] = None) -> None:
+    """Remove baked files and unused original under storage/uploads/."""
+    shutil.rmtree(STORAGE / "characters" / character_id, ignore_errors=True)
+    if not source_path:
+        return
+    src = Path(source_path)
+    uploads_root = (STORAGE / "uploads").resolve()
+    candidate = src.resolve() if src.exists() else src
+    try:
+        candidate.relative_to(uploads_root)
+    except ValueError:
+        return
+    from . import db
+
+    with db.db() as conn:
+        others = conn.execute(
+            "SELECT 1 FROM characters WHERE source_path = ? AND id != ? LIMIT 1",
+            (str(src), character_id),
+        ).fetchone()
+        if others:
+            return
+    parent = candidate.parent
+    try:
+        parent_resolved = parent.resolve()
+        if parent_resolved == uploads_root:
+            candidate.unlink(missing_ok=True)
+            return
+        parent_resolved.relative_to(uploads_root)
+    except (ValueError, OSError):
+        candidate.unlink(missing_ok=True)
+        return
+    shutil.rmtree(parent, ignore_errors=True)
+
+
 def merge_upload_chunks(upload_id: str, dest: Path, total_chunks: int, expected_size: int) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    chunk_dir = STORAGE / "chunks" / upload_id
+    parts_dir = chunk_dir(upload_id)
     with dest.open("wb") as out:
         for i in range(total_chunks):
-            part = chunk_dir / f"{i:06d}.part"
+            part = parts_dir / f"{i:06d}.part"
             if not part.exists():
+                dest.unlink(missing_ok=True)
                 raise FileNotFoundError(f"分片 {i} 文件丢失")
             written += out.write(part.read_bytes())
     if written != expected_size:
         dest.unlink(missing_ok=True)
         raise ValueError("合并后文件大小与声明不一致")
-    shutil.rmtree(chunk_dir, ignore_errors=True)
+    shutil.rmtree(parts_dir, ignore_errors=True)
     return written
+
+
+def _dir_activity_ts(path: Path) -> float:
+    latest = path.stat().st_mtime
+    try:
+        for child in path.iterdir():
+            try:
+                latest = max(latest, child.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return latest
+
+
+def _created_at_ts(text: Optional[str]) -> float:
+    raw = (text or "").strip()
+    if not raw:
+        return 0.0
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+0000"
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            dt = datetime.strptime(raw, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def purge_stale_uploads(*, max_age_sec: int = CHUNK_TTL_SECONDS, force: bool = False) -> int:
+    """Drop incomplete chunk dirs and abandoned upload rows after max_age_sec of inactivity."""
+    global _last_purge_at
+    now = time.time()
+    if not force and now - _last_purge_at < _PURGE_MIN_INTERVAL:
+        return 0
+    _last_purge_at = now
+    removed = 0
+    root = STORAGE / "chunks"
+    if root.is_dir():
+        for path in list(root.iterdir()):
+            if not path.is_dir():
+                continue
+            try:
+                age = now - _dir_activity_ts(path)
+            except OSError:
+                continue
+            if age < max_age_sec:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    try:
+        from . import db
+
+        with db.db() as conn:
+            rows = conn.execute("SELECT id, status, created_at FROM uploads").fetchall()
+            for row in rows:
+                if (row["status"] or "") == "ready":
+                    continue
+                uid = row["id"]
+                path = STORAGE / "chunks" / uid if isinstance(uid, str) else None
+                fresh = False
+                if path is not None and path.is_dir():
+                    try:
+                        fresh = (now - _dir_activity_ts(path)) < max_age_sec
+                    except OSError:
+                        fresh = False
+                created = _created_at_ts(row["created_at"])
+                if fresh or (created and now - created < max_age_sec):
+                    continue
+                if path is not None:
+                    shutil.rmtree(path, ignore_errors=True)
+                conn.execute("DELETE FROM uploads WHERE id = ? AND status != ?", (uid, "ready"))
+                removed += 1
+    except Exception:
+        pass
+    return removed

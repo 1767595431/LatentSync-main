@@ -63,6 +63,7 @@ async def lifespan(_: FastAPI):
     # API process: no worker start/stop, never kill inference.
     ensure_dirs()
     db.init_db()
+    avatars.purge_stale_uploads(force=True)
     yield
 
 
@@ -249,6 +250,13 @@ def _ext(name: str) -> str:
     return Path(name).suffix.lower()
 
 
+def _require_upload_id(upload_id: str) -> str:
+    try:
+        return avatars.parse_upload_id(upload_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "上传任务不存在") from None
+
+
 @app.post("/api/uploads")
 def create_upload(body: UploadInitBody):
     ext = _ext(body.filename)
@@ -265,6 +273,7 @@ def create_upload(body: UploadInitBody):
 
     upload_id = uuid.uuid4().hex
     total_chunks = max(1, math.ceil(body.size / CHUNK_SIZE))
+    avatars.purge_stale_uploads()
     chunk_dir = STORAGE / "chunks" / upload_id
     chunk_dir.mkdir(parents=True, exist_ok=True)
     with db.db() as conn:
@@ -294,6 +303,7 @@ def create_upload(body: UploadInitBody):
 
 @app.get("/api/uploads/{upload_id}")
 def get_upload(upload_id: str):
+    upload_id = _require_upload_id(upload_id)
     with db.db() as conn:
         row = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
     if row is None:
@@ -305,6 +315,7 @@ def get_upload(upload_id: str):
 
 @app.put("/api/uploads/{upload_id}/chunks/{index}")
 async def put_chunk(upload_id: str, index: int, request: Request):
+    upload_id = _require_upload_id(upload_id)
     with db.db() as conn:
         row = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
         if row is None:
@@ -328,10 +339,17 @@ async def put_chunk(upload_id: str, index: int, request: Request):
         raise HTTPException(400, f"分片大小应为 {upload['chunk_size']} 字节")
 
     chunk_path = STORAGE / "chunks" / upload_id / f"{index:06d}.part"
-    chunk_path.write_bytes(data)
+    try:
+        chunk_path.write_bytes(data)
+    except FileNotFoundError:
+        avatars.discard_upload_chunks(upload_id)
+        raise HTTPException(404, "上传任务不存在") from None
 
     with db.db() as conn:
         row = conn.execute("SELECT received FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+        if row is None:
+            avatars.discard_upload_chunks(upload_id)
+            raise HTTPException(404, "上传任务不存在")
         received = set(json.loads(row["received"] or "[]"))
         received.add(index)
         conn.execute(
@@ -343,6 +361,7 @@ async def put_chunk(upload_id: str, index: int, request: Request):
 
 @app.post("/api/uploads/{upload_id}/complete")
 def complete_upload(upload_id: str):
+    upload_id = _require_upload_id(upload_id)
     with db.db() as conn:
         row = conn.execute("SELECT * FROM uploads WHERE id = ?", (upload_id,)).fetchone()
         if row is None:
@@ -358,21 +377,43 @@ def complete_upload(upload_id: str):
         dest = dest_dir / upload["filename"]
         chunk_dir = STORAGE / "chunks" / upload_id
         written = 0
-        with dest.open("wb") as out:
-            for i in range(upload["total_chunks"]):
-                part = chunk_dir / f"{i:06d}.part"
-                if not part.exists():
-                    raise HTTPException(400, f"分片 {i} 文件丢失")
-                written += out.write(part.read_bytes())
-        if written != upload["size"]:
+        try:
+            with dest.open("wb") as out:
+                for i in range(upload["total_chunks"]):
+                    part = chunk_dir / f"{i:06d}.part"
+                    if not part.exists():
+                        raise HTTPException(400, f"分片 {i} 文件丢失")
+                    written += out.write(part.read_bytes())
+            if written != upload["size"]:
+                raise HTTPException(400, "合并后文件大小与声明不一致")
+        except HTTPException:
             dest.unlink(missing_ok=True)
-            raise HTTPException(400, "合并后文件大小与声明不一致")
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            try:
+                avatars.discard_upload_chunks(upload_id)
+            except FileNotFoundError:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
+            raise
         shutil.rmtree(chunk_dir, ignore_errors=True)
         conn.execute(
             "UPDATE uploads SET status = ?, path = ? WHERE id = ?",
             ("ready", str(dest), upload_id),
         )
     return {"ok": True, "upload_id": upload_id, "path": str(dest), "size": written}
+
+
+@app.delete("/api/uploads/{upload_id}")
+def abort_generic_upload(upload_id: str):
+    upload_id = _require_upload_id(upload_id)
+    with db.db() as conn:
+        row = conn.execute("SELECT status FROM uploads WHERE id = ?", (upload_id,)).fetchone()
+        if row is None:
+            avatars.discard_upload_chunks(upload_id)
+            return {"ok": True, "upload_id": upload_id}
+        if dict(row).get("status") == "ready":
+            raise HTTPException(400, "该上传已结束")
+    avatars.abort_upload(upload_id)
+    return {"ok": True, "upload_id": upload_id}
 
 
 @app.get("/api/characters")
@@ -425,7 +466,7 @@ def create_character(body: CharacterCreateBody):
         source = Path(upload["path"])
         if not source.exists():
             raise HTTPException(400, "视频文件不存在")
-        char_id = uuid.uuid4().hex
+        char_id = avatars.new_character_id(conn)
         conn.execute(
             """
             INSERT INTO characters (id, name, source_path, status, created_at, type, user_id)
@@ -453,7 +494,7 @@ def character_video(character_id: str, request: Request):
     row = _visible_character_file(character_id, request)
     preview = Path(row["preview_path"]) if row.get("preview_path") else None
     full = Path(row["video_path"]) if row.get("video_path") else None
-    path = preview if preview and preview.exists() else full
+    path = preview if preview and preview.exists() else None
     if path is None or not path.exists():
         raise HTTPException(404, "形象视频不存在")
     return _send_media(
@@ -482,8 +523,9 @@ def delete_character(
         row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
         if row is None:
             raise HTTPException(404, "形象不存在")
+        source_path = dict(row).get("source_path")
         conn.execute("DELETE FROM characters WHERE id = ?", (character_id,))
-    shutil.rmtree(STORAGE / "characters" / character_id, ignore_errors=True)
+    avatars.purge_character_files(character_id, source_path)
     return {"ok": True}
 
 
@@ -521,7 +563,8 @@ def list_avatars(
 
 @app.post("/api/avatars/upload")
 async def upload_avatar(
-    stage: str = Form(...),
+    request: Request,
+    stage: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     type: Optional[str] = Form("public"),
     username: Optional[str] = Form(None),
@@ -534,11 +577,15 @@ async def upload_avatar(
     total_chunks: Optional[int] = Form(None),
     chunk: Optional[UploadFile] = File(None),
 ):
-    stage = (stage or "").strip().lower()
+    stage = (stage or request.query_params.get("stage") or "").strip().lower()
+    upload_id = upload_id or request.query_params.get("upload_id")
+    avatars.purge_stale_uploads()
     if stage == "init":
         display = (name or "").strip()
         if not display:
             return fail("请填写形象名称")
+        if len(display) > 80:
+            return fail("形象名称不能超过 80 个字符")
         try:
             avatar_type = avatars.normalize_type(type)
             owner = avatars.resolve_owner(avatar_type, user_id, username)
@@ -567,18 +614,25 @@ async def upload_avatar(
                 "total_chunks": total,
                 "received": [],
             },
+            create=True,
         )
         return ok({"upload_id": uid, "total_chunks": total, "chunk_size": piece})
 
     if stage == "chunk":
-        if not upload_id or chunk is None or chunk_index is None:
+        try:
+            upload_id = avatars.parse_upload_id(upload_id)
+        except FileNotFoundError:
+            return fail("上传任务不存在")
+        if chunk is None or chunk_index is None:
             return fail("分片参数不完整")
         try:
             meta = avatars.read_upload_meta(upload_id)
         except FileNotFoundError:
             return fail("上传任务不存在")
         index = int(chunk_index)
-        total = int(total_chunks or meta["total_chunks"])
+        total = int(meta["total_chunks"])
+        if total_chunks is not None and int(total_chunks) != total:
+            return fail("分片总数与初始化不一致")
         if index < 0 or index >= total:
             return fail("分片序号无效")
         data = await chunk.read()
@@ -591,16 +645,22 @@ async def upload_avatar(
         if not is_last and len(data) != meta["chunk_size"]:
             return fail(f"分片大小应为 {meta['chunk_size']} 字节")
         part = STORAGE / "chunks" / upload_id / f"{index:06d}.part"
-        part.write_bytes(data)
-        received = set(meta.get("received") or [])
-        received.add(index)
-        meta["received"] = sorted(received)
-        avatars.write_upload_meta(upload_id, meta)
+        try:
+            part.write_bytes(data)
+            received = set(meta.get("received") or [])
+            received.add(index)
+            meta["received"] = sorted(received)
+            avatars.write_upload_meta(upload_id, meta)
+        except FileNotFoundError:
+            avatars.discard_upload_chunks(upload_id)
+            return fail("上传任务不存在")
         return ok({"index": index, "received": len(received), "total_chunks": total})
 
     if stage == "complete":
-        if not upload_id:
-            return fail("缺少 upload_id")
+        try:
+            upload_id = avatars.parse_upload_id(upload_id)
+        except FileNotFoundError:
+            return fail("缺少 upload_id" if not upload_id else "上传任务不存在")
         try:
             meta = avatars.read_upload_meta(upload_id)
         except FileNotFoundError:
@@ -614,18 +674,37 @@ async def upload_avatar(
         try:
             avatars.merge_upload_chunks(upload_id, dest, total, int(meta["size"]))
         except (FileNotFoundError, ValueError) as exc:
+            dest.unlink(missing_ok=True)
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            avatars.discard_upload_chunks(upload_id)
             return fail(str(exc))
-        char_id = uuid.uuid4().hex
-        with db.db() as conn:
-            conn.execute(
-                """
-                INSERT INTO characters (id, name, source_path, status, created_at, type, user_id)
-                VALUES (?, ?, ?, 'queued', ?, ?, ?)
-                """,
-                (char_id, meta["name"], str(dest), db.utcnow(), meta["type"], meta.get("user_id")),
-            )
-            row = conn.execute("SELECT * FROM characters WHERE id = ?", (char_id,)).fetchone()
+        try:
+            with db.db() as conn:
+                char_id = avatars.new_character_id(conn)
+                conn.execute(
+                    """
+                    INSERT INTO characters (id, name, source_path, status, created_at, type, user_id)
+                    VALUES (?, ?, ?, 'queued', ?, ?, ?)
+                    """,
+                    (char_id, meta["name"], str(dest), db.utcnow(), meta["type"], meta.get("user_id")),
+                )
+                row = conn.execute("SELECT * FROM characters WHERE id = ?", (char_id,)).fetchone()
+        except Exception:
+            dest.unlink(missing_ok=True)
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            avatars.discard_upload_chunks(upload_id)
+            return fail("创建形象失败")
         return ok(avatars.to_admin_avatar(dict(row)), "上传成功，正在处理")
+
+    if stage == "abort":
+        if not upload_id:
+            return fail("缺少 upload_id")
+        try:
+            uid = avatars.parse_upload_id(upload_id)
+            avatars.abort_upload(uid)
+        except FileNotFoundError:
+            return fail("上传任务不存在")
+        return ok({"upload_id": uid}, "已取消并清理分片")
 
     return fail("未知的上传阶段")
 
@@ -675,8 +754,10 @@ def delete_avatar(
         ).fetchone()
         if busy:
             return fail("该形象还有排队或正在合成的任务")
+        row = conn.execute("SELECT source_path FROM characters WHERE id = ?", (identifier,)).fetchone()
+        source_path = dict(row).get("source_path") if row else None
         conn.execute("DELETE FROM characters WHERE id = ?", (identifier,))
-    shutil.rmtree(STORAGE / "characters" / identifier, ignore_errors=True)
+    avatars.purge_character_files(identifier, source_path)
     return ok({"identifier": identifier}, "已删除")
 
 
@@ -1229,18 +1310,39 @@ def admin_logout(request: Request, response: Response, qemix_gate: Optional[str]
     return ok({"ok": True}, "已退出")
 
 
+_HTML_NO_STORE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+
+def _asset_query(name: str) -> str:
+    path = ADMIN_DIR / "assets" / name
+    try:
+        return str(int(path.stat().st_mtime))
+    except OSError:
+        return "1"
+
+
 def _inject_base(html: str) -> str:
     script = f"<script>{_BASE_JS}</script>"
+    for name in ("style.css", "app.js", "fx.js"):
+        token = f"admin/assets/{name}"
+        html = html.replace(token, f"{token}?v={_asset_query(name)}", 1)
     if "<!--APP_BASE-->" in html:
         return html.replace("<!--APP_BASE-->", script, 1)
     return script + html
+
+
+def _html_page(content: str) -> HTMLResponse:
+    return HTMLResponse(content, headers=_HTML_NO_STORE)
 
 
 def _page(name: str) -> HTMLResponse:
     html = ADMIN_DIR / name
     if not html.exists():
         raise HTTPException(404, "页面缺失")
-    return HTMLResponse(_inject_base(html.read_text(encoding="utf-8")))
+    return _html_page(_inject_base(html.read_text(encoding="utf-8")))
 
 
 @app.get("/login.html", response_class=HTMLResponse, include_in_schema=False)
@@ -1253,7 +1355,7 @@ def index():
     html = ADMIN_DIR / "index.html"
     if not html.exists():
         raise HTTPException(500, "前端页面缺失")
-    return HTMLResponse(_inject_base(html.read_text(encoding="utf-8")))
+    return _html_page(_inject_base(html.read_text(encoding="utf-8")))
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -1350,6 +1452,7 @@ _CN_DOCS = {
     ("GET", "/api/uploads/{upload_id}"): ("查询分片上传", "上传"),
     ("PUT", "/api/uploads/{upload_id}/chunks/{index}"): ("上传一个分片", "上传"),
     ("POST", "/api/uploads/{upload_id}/complete"): ("合并分片文件", "上传"),
+    ("DELETE", "/api/uploads/{upload_id}"): ("取消分片上传并清理", "上传"),
     ("GET", "/api/characters"): ("列出形象", "形象"),
     ("POST", "/api/characters"): ("创建形象", "形象"),
     ("GET", "/api/characters/{character_id}"): ("查询形象", "形象"),
@@ -1357,7 +1460,7 @@ _CN_DOCS = {
     ("GET", "/api/characters/{character_id}/poster"): ("获取形象封面", "形象"),
     ("GET", "/api/characters/{character_id}/video"): ("获取形象视频", "形象"),
     ("GET", "/api/avatars"): ("分页列出形象", "形象"),
-    ("POST", "/api/avatars/upload"): ("分片上传形象", "形象"),
+    ("POST", "/api/avatars/upload"): ("分片/批量上传形象", "形象"),
     ("POST", "/api/avatars/{identifier}/rebake"): ("重新转码形象", "形象"),
     ("DELETE", "/api/avatars/{identifier}"): ("按标识删除形象", "形象"),
     ("GET", "/api/jobs"): ("列出合成任务", "作品"),

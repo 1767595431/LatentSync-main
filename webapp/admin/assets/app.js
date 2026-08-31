@@ -108,8 +108,13 @@ function toast(msg, type = 'info') {
 
 async function api(path, opts = {}) {
   const timeoutMs = opts.timeoutMs ?? 20000;
-  const { timeoutMs: _drop, ...fetchOpts } = opts;
+  const { timeoutMs: _drop, signal: outer, ...fetchOpts } = opts;
   const ctrl = new AbortController();
+  const onOuter = () => ctrl.abort();
+  if (outer) {
+    if (outer.aborted) ctrl.abort();
+    else outer.addEventListener('abort', onOuter, { once: true });
+  }
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(API + path, { credentials: 'same-origin', ...fetchOpts, signal: ctrl.signal });
@@ -119,11 +124,12 @@ async function api(path, opts = {}) {
     return { ok: res.ok, data: res };
   } catch (e) {
     if (e?.name === 'AbortError') {
-      return { ok: false, data: { code: 1, msg: '请求超时，后台任务繁忙时请稍后再试', success: false } };
+      return { ok: false, data: { code: 1, msg: outer?.aborted ? '已取消' : '请求超时，后台任务繁忙时请稍后再试', success: false } };
     }
     throw e;
   } finally {
     clearTimeout(timer);
+    outer?.removeEventListener?.('abort', onOuter);
   }
 }
 
@@ -396,10 +402,10 @@ async function refreshAvatarCounts() {
   }
 }
 
-async function loadAvatarsData() {
+async function loadAvatarsData({ animate = true } = {}) {
   await refreshAvatarCounts();
-  if (currentPage === 'avatars') await renderAvatars();
-  else if (currentPage === 'create') await renderCreateAvatars();
+  if (currentPage === 'avatars') await renderAvatars({ animate });
+  else if (currentPage === 'create') await renderCreateAvatars({ animate });
   await refreshSystemStatsQuiet();
   scheduleBakePoll();
 }
@@ -952,6 +958,7 @@ let loggingOut = false;
 async function forceLogout(reason) {
   if (loggingOut) return;
   loggingOut = true;
+  try { await abortAllUploads(); } catch { /* ignore */ }
   try { sessionStorage.removeItem('dh_admin_gate_tab'); } catch { /* ignore */ }
   try {
     await fetch(API + '/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
@@ -963,14 +970,26 @@ async function forceLogout(reason) {
 function bumpIdle() {
   if (loggingOut) return;
   if (idleTimer) clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => forceLogout('idle'), idleMs);
+  idleTimer = setTimeout(() => {
+    if (hasActiveUploads()) {
+      bumpIdle();
+      return;
+    }
+    forceLogout('idle');
+  }, idleMs);
   const now = Date.now();
   if (now - lastHeartbeatAt < 30000) return;
   lastHeartbeatAt = now;
   fetch(API + '/api/admin/heartbeat', { method: 'POST', credentials: 'same-origin' })
     .then((res) => res.json().catch(() => ({})))
     .then((body) => {
-      if (body && body.code !== 0) forceLogout('expired');
+      if (body && body.code !== 0) {
+        if (hasActiveUploads()) {
+          bumpIdle();
+          return;
+        }
+        forceLogout('expired');
+      }
     })
     .catch(() => {});
 }
@@ -1497,7 +1516,7 @@ async function renderAvatars({ animate = true } = {}) {
   } else if (avatarTab === 'public') {
     grid.innerHTML = items.length
       ? items.map((a) => renderAvatarCard(a)).join('')
-      : '<div class="empty-state inline"><p>暂无公共形象，可在右侧上传</p></div>';
+      : '<div class="empty-state inline"><p>暂无公共形象，点击「上传形象」</p></div>';
   } else {
     grid.innerHTML = items.length
       ? items.map((a) => renderAvatarCard(a)).join('')
@@ -1618,120 +1637,396 @@ async function assertFileWithinLimit(file, kind) {
   return duration;
 }
 
-function setAvatarVideoLabel(file) {
-  const el = $('#avatarVideoLabel');
-  if (!el) return;
-  if (!file) {
-    el.innerHTML = '拖拽或 <strong>点击选择</strong> 视频文件';
+/* ---- Batch avatar upload (modal + bubble, survives page switches) ---- */
+
+const VIDEO_EXTS = /\.(mp4|mov|mkv|webm|avi)$/i;
+const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
+const UPLOAD_CONCURRENCY = 2;
+
+let upDrafts = [];
+let upJobs = [];
+let upRunning = 0;
+let upSeq = 0;
+
+function fileStem(name) {
+  return String(name || '').replace(/\.[^.]+$/i, '').trim() || name;
+}
+
+function hasActiveUploads() {
+  return upJobs.some((j) => j.status === 'queued' || j.status === 'uploading');
+}
+
+function setUpDock(open) {
+  const dock = $('#upDock');
+  if (!dock) return;
+  dock.classList.toggle('hidden', !open);
+  dock.setAttribute('aria-hidden', open ? 'false' : 'true');
+}
+
+function openUploadModal() {
+  syncUpTypeUi();
+  $('#upModal')?.classList.remove('hidden');
+  $('#upModal')?.setAttribute('aria-hidden', 'false');
+  document.body.style.overflow = 'hidden';
+  renderUpDrafts();
+}
+
+function closeUploadModal() {
+  $('#upModal')?.classList.add('hidden');
+  $('#upModal')?.setAttribute('aria-hidden', 'true');
+  document.body.style.overflow = '';
+}
+
+function addUpFiles(fileList) {
+  const files = [...(fileList || [])];
+  for (const file of files) {
+    if (!VIDEO_EXTS.test(file.name)) {
+      toast(`不支持的格式：${file.name}`, 'error');
+      continue;
+    }
+    if (!file.size) {
+      toast(`${file.name} 是空文件`, 'error');
+      continue;
+    }
+    if (file.size > MAX_VIDEO_BYTES) {
+      toast(`${file.name} 超过 2GB`, 'error');
+      continue;
+    }
+    if (upDrafts.some((d) => d.file.name === file.name && d.file.size === file.size)) continue;
+    upDrafts.push({ id: `d${++upSeq}`, file, name: fileStem(file.name).slice(0, 80) });
+  }
+  renderUpDrafts();
+}
+
+function renderUpDrafts() {
+  const box = $('#upDraftList');
+  const meta = $('#upDraftMeta');
+  const start = $('#upModalStart');
+  if (!box) return;
+  if (!upDrafts.length) {
+    box.innerHTML = '<p class="hint-text" style="text-align:center;padding:12px 0">还没有选择文件</p>';
+    if (meta) meta.textContent = '';
+    if (start) {
+      start.disabled = true;
+      start.textContent = '开始上传';
+    }
     return;
   }
-  el.innerHTML = `已选择：<strong>${esc(file.name)}</strong>（${formatFileSize(file.size)}）`;
-}
-
-function onAvatarVideoPicked(file) {
-  setAvatarVideoLabel(file);
-  if (!file) return;
-  const form = $('#avatarForm');
-  if (!form) return;
-  const stem = file.name.replace(/\.[^.]+$/i, '').trim();
-  const nameInput = form.elements.name;
-  if (nameInput && !nameInput.value.trim()) nameInput.value = stem || file.name;
-  assertFileWithinLimit(file, 'video')
-    .then((d) => {
-      const el = $('#avatarVideoLabel');
-      if (el) el.innerHTML = `已选择：<strong>${esc(file.name)}</strong>（${formatDurationCn(d)}，${formatFileSize(file.size)}）`;
-    })
-    .catch((err) => {
-      toast(err.message, 'error');
-      const input = form.querySelector('input[name="video"]');
-      if (input) input.value = '';
-      setAvatarVideoLabel(null);
-    });
-}
-
-/* ---- Forms ---- */
-
-$('#avatarType')?.addEventListener('change', (e) => {
-  $('#avatarUserWrap').classList.toggle('hidden', e.target.value !== 'private');
-});
-
-$('#avatarForm')?.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const form = e.target;
-  const file = form.video.files[0];
-  if (!file) return toast('请选择视频', 'error');
-  try {
-    await assertFileWithinLimit(file, 'video');
-  } catch (err) {
-    return toast(err.message, 'error');
+  box.innerHTML = upDrafts.map((d) => `
+    <div class="up-row" data-draft="${esc(d.id)}">
+      <input class="name" data-draft-name="${esc(d.id)}" value="${esc(d.name)}" maxlength="80">
+      <button type="button" class="rm" data-draft-rm="${esc(d.id)}" aria-label="移除">&times;</button>
+      <span class="meta">${esc(d.file.name)} · ${formatFileSize(d.file.size)}</span>
+    </div>`).join('');
+  if (meta) meta.textContent = `已选 ${upDrafts.length} 个视频`;
+  if (start) {
+    start.disabled = false;
+    start.textContent = `开始上传（${upDrafts.length}）`;
   }
-  const btn = $('#avatarSubmit');
-  const bar = $('#uploadBar');
-  const progress = $('#uploadProgress');
-  const status = $('#uploadStatus');
-  const setP = (p) => {
-    const pct = Math.max(0, Math.min(100, Math.round(p)));
-    if (bar) bar.style.width = pct + '%';
-    if (status) status.textContent = pct + '%';
-  };
-  const resetUploadUi = () => {
-    form.reset();
-    setAvatarVideoLabel(null);
-    $('#avatarUserWrap')?.classList.toggle('hidden', true);
-    if (bar) bar.style.width = '0%';
-    if (status) status.textContent = '0%';
-    progress?.classList.add('hidden');
-  };
-  btn.disabled = true;
-  progress?.classList.remove('hidden');
-  setP(0);
+}
+
+function syncUpTypeUi() {
+  $('#upUserWrap')?.classList.toggle('hidden', $('#upType')?.value !== 'private');
+}
+
+function renderUploadChrome() {
+  const active = upJobs.filter((j) => j.status === 'queued' || j.status === 'uploading');
+  const failed = upJobs.filter((j) => j.status === 'error');
+  const bubble = $('#upBubble');
+  const count = $('#upBubbleCount');
+  const show = upJobs.length > 0;
+  bubble?.classList.toggle('hidden', !show);
+  bubble?.classList.toggle('busy', active.length > 0);
+  bubble?.classList.toggle('done', show && !active.length && !failed.length);
+  if (count) count.textContent = String(active.length || failed.length || upJobs.length);
+  const dock = $('#upDockList');
+  if (!dock) return;
+  if (!upJobs.length) {
+    dock.innerHTML = '<p class="hint-text" style="padding:12px">暂无上传任务</p>';
+    return;
+  }
+  dock.innerHTML = upJobs.map((j) => {
+    const st = j.status === 'uploading' ? `上传中 ${j.progress}%`
+      : j.status === 'queued' ? '排队中'
+      : j.status === 'done' ? '已完成'
+      : '失败';
+    const cls = j.status === 'uploading' || j.status === 'queued' ? 'run'
+      : j.status === 'done' ? 'ok' : 'err';
+    return `<div class="up-job ${j.status === 'done' ? 'ok' : j.status === 'error' ? 'err' : ''}">
+      <div class="up-job-top"><b title="${esc(j.name)}">${esc(j.name)}</b><span class="up-job-st ${cls}">${st}</span></div>
+      <div class="bar"><i style="width:${j.progress || 0}%"></i></div>
+      ${j.error ? `<div class="err-msg">${esc(j.error)}${j.status === 'error' ? ` <button type="button" class="btn btn-ghost btn-sm" data-up-retry="${esc(j.id)}">重试</button>` : ''}</div>` : ''}
+      ${(j.status === 'queued' || j.status === 'uploading') ? `<button type="button" class="btn btn-ghost btn-sm up-cancel" data-up-cancel="${esc(j.id)}">取消</button>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function enqueueDrafts() {
+  const type = $('#upType')?.value || 'public';
+  const username = ($('#upUser')?.value || '').trim();
+  if (type === 'private' && !username) {
+    toast('个人形象请填写用户ID', 'error');
+    return false;
+  }
+  if (type === 'private' && /[\\/:*?"<>|]/.test(username)) {
+    toast('用户ID不能包含 \\ / : * ? " < > |', 'error');
+    return false;
+  }
+  if (type === 'private' && username.length > 64) {
+    toast('用户ID不能超过 64 个字符', 'error');
+    return false;
+  }
+  if (!upDrafts.length) {
+    toast('请先选择视频', 'error');
+    return false;
+  }
+  for (const d of upDrafts) {
+    const name = ((d.name || '').trim() || fileStem(d.file.name)).slice(0, 80);
+    upJobs.push({
+      id: d.id,
+      file: d.file,
+      name,
+      type,
+      username: type === 'private' ? username : '',
+      status: 'queued',
+      progress: 0,
+      error: '',
+      cancelled: false,
+      uploadId: '',
+    });
+  }
+  upDrafts = [];
+  renderUpDrafts();
+  renderUploadChrome();
+  setUpDock(true);
+  pumpUploads();
+  return true;
+}
+
+function pumpUploads() {
+  while (upRunning < UPLOAD_CONCURRENCY) {
+    const job = upJobs.find((j) => j.status === 'queued' && !j.cancelled);
+    if (!job) break;
+    upRunning += 1;
+    job.status = 'uploading';
+    renderUploadChrome();
+    runAvatarUpload(job).finally(() => {
+      upRunning -= 1;
+      renderUploadChrome();
+      pumpUploads();
+      if (job.status === 'done' && job.type === 'private' && job.username) {
+        ['#avatarPrivateSearch', '#createPrivateSearch'].forEach((sel) => {
+          const el = $(sel);
+          if (el && !(el.value || '').trim()) el.value = job.username;
+        });
+      }
+      loadAvatarsData({ animate: false }).then(() => {
+        if (currentPage === 'home') refreshHome(false);
+      }).catch(() => {});
+    });
+  }
+}
+
+async function abortAvatarUpload(uploadId) {
+  if (!uploadId) return;
+  const body = new FormData();
+  body.append('stage', 'abort');
+  body.append('upload_id', uploadId);
   try {
-    const chunkSize = 8 * 1024 * 1024;
-    const total = Math.ceil(file.size / chunkSize);
+    await api('/api/avatars/upload', { method: 'POST', body, timeoutMs: 20000 });
+  } catch { /* ignore */ }
+}
+
+async function abortAllUploads() {
+  const jobs = upJobs.filter((j) => j.status === 'queued' || j.status === 'uploading');
+  const ids = [...new Set(jobs.map((j) => j.uploadId).filter(Boolean))];
+  jobs.forEach((j) => {
+    j.cancelled = true;
+    try { j.abortCtrl?.abort(); } catch { /* ignore */ }
+    if (j.status === 'queued') {
+      j.status = 'error';
+      j.error = '已取消';
+      j.progress = 0;
+      j.uploadId = '';
+    }
+  });
+  renderUploadChrome();
+  await Promise.all(ids.map((id) => abortAvatarUpload(id)));
+}
+
+function beaconAbortUploads() {
+  upJobs.forEach((j) => {
+    if (!j.uploadId) return;
+    if (j.status !== 'queued' && j.status !== 'uploading') return;
+    try {
+      const url = `${API}/api/avatars/upload?stage=abort&upload_id=${encodeURIComponent(j.uploadId)}`;
+      navigator.sendBeacon(url, '');
+    } catch { /* ignore */ }
+  });
+}
+
+function cancelUploadJob(job) {
+  if (!job || (job.status !== 'queued' && job.status !== 'uploading')) return;
+  job.cancelled = true;
+  try { job.abortCtrl?.abort(); } catch { /* ignore */ }
+  const uid = job.uploadId;
+  job.uploadId = '';
+  if (job.status === 'queued') {
+    job.status = 'error';
+    job.error = '已取消';
+    job.progress = 0;
+  }
+  abortAvatarUpload(uid);
+  renderUploadChrome();
+}
+
+async function runAvatarUpload(job) {
+  let uid = '';
+  const abortCtrl = new AbortController();
+  job.abortCtrl = abortCtrl;
+  const uploadOpts = { signal: abortCtrl.signal, timeoutMs: 180000 };
+  try {
+    if (job.cancelled) throw new Error('已取消');
+    const file = job.file;
+    const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK));
     const init = new FormData();
     init.append('stage', 'init');
-    ['name', 'type'].forEach((k) => init.append(k, form[k].value));
-    if (form.type.value === 'private') init.append('username', form.username.value);
+    init.append('name', job.name);
+    init.append('type', job.type);
+    if (job.type === 'private') init.append('username', job.username);
     init.append('filename', file.name);
     init.append('filesize', String(file.size));
-    init.append('chunk_size', String(chunkSize));
-    const { data: ir } = await api('/api/avatars/upload', { method: 'POST', body: init });
-    if (ir.code !== 0) throw new Error(ir.msg);
-    const uid = ir.data.upload_id;
+    init.append('chunk_size', String(UPLOAD_CHUNK));
+    const { data: ir } = await api('/api/avatars/upload', { method: 'POST', body: init, ...uploadOpts });
+    if (!ir || ir.code !== 0) throw new Error(ir?.msg || ir?.detail || '初始化上传失败');
+    uid = ir.data?.upload_id || '';
+    if (!uid) throw new Error('未返回上传ID');
+    if (job.cancelled) throw new Error('已取消');
+    job.uploadId = uid;
     for (let i = 0; i < total; i++) {
+      if (job.cancelled) throw new Error('已取消');
       const c = new FormData();
       c.append('stage', 'chunk');
       c.append('upload_id', uid);
       c.append('chunk_index', String(i));
       c.append('total_chunks', String(total));
-      c.append('chunk', file.slice(i * chunkSize, (i + 1) * chunkSize));
-      setP(((i + 1) / total) * 100);
-      const { data: cr } = await api('/api/avatars/upload', { method: 'POST', body: c });
-      if (cr.code !== 0) throw new Error(cr.msg);
+      c.append('chunk', file.slice(i * UPLOAD_CHUNK, (i + 1) * UPLOAD_CHUNK));
+      const { data: cr } = await api('/api/avatars/upload', { method: 'POST', body: c, ...uploadOpts });
+      if (!cr || cr.code !== 0) throw new Error(cr?.msg || cr?.detail || '分片上传失败');
+      job.progress = Math.round(((i + 1) / total) * 100);
+      renderUploadChrome();
     }
+    if (job.cancelled) throw new Error('已取消');
     const done = new FormData();
     done.append('stage', 'complete');
     done.append('upload_id', uid);
-    const { data: fr } = await api('/api/avatars/upload', { method: 'POST', body: done });
-    if (fr.code !== 0) throw new Error(fr.msg);
-    setP(100);
-    toast('上传成功，正在处理', 'success');
-    const uploadedType = form.type.value;
-    const uploadedUser = form.username?.value?.trim() || '';
-    resetUploadUi();
-    if (uploadedType === 'private' && uploadedUser) {
-      avatarTab = 'private';
-      avatarPrivatePage = 1;
-      if ($('#avatarPrivateSearch')) $('#avatarPrivateSearch').value = uploadedUser;
-      if ($('#createPrivateSearch')) $('#createPrivateSearch').value = uploadedUser;
-    }
-    await loadAvatarsData();
+    const { data: fr } = await api('/api/avatars/upload', { method: 'POST', body: done, ...uploadOpts });
+    if (!fr || fr.code !== 0) throw new Error(fr?.msg || fr?.detail || '合并上传失败');
+    job.progress = 100;
+    job.status = 'done';
+    job.uploadId = '';
   } catch (err) {
-    toast(err.message, 'error');
+    job.status = 'error';
+    job.error = job.cancelled ? '已取消' : (err.message || '上传失败');
+    if (!job.cancelled) toast(`${job.name}：${job.error}`, 'error');
+    abortAvatarUpload(uid || job.uploadId);
+    job.uploadId = '';
   } finally {
-    btn.disabled = false;
+    job.abortCtrl = null;
   }
-});
+}
+
+function bindUploadUi() {
+  $('#btnOpenUpload')?.addEventListener('click', openUploadModal);
+  $('#upModalClose')?.addEventListener('click', closeUploadModal);
+  $('#upModalCancel')?.addEventListener('click', closeUploadModal);
+  $('#upModal')?.addEventListener('click', (e) => {
+    if (e.target === $('#upModal')) closeUploadModal();
+  });
+  $('#upType')?.addEventListener('change', syncUpTypeUi);
+  const drop = $('#upDrop');
+  const fileInput = $('#upFile');
+  fileInput?.addEventListener('change', (e) => {
+    addUpFiles(e.target.files);
+    e.target.value = '';
+  });
+  drop?.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    drop.classList.add('drag');
+  });
+  drop?.addEventListener('dragleave', () => drop.classList.remove('drag'));
+  drop?.addEventListener('drop', (e) => {
+    e.preventDefault();
+    drop.classList.remove('drag');
+    addUpFiles(e.dataTransfer?.files);
+  });
+  $('#upDraftList')?.addEventListener('input', (e) => {
+    const id = e.target.dataset.draftName;
+    if (!id) return;
+    const item = upDrafts.find((d) => d.id === id);
+    if (item) item.name = e.target.value;
+  });
+  $('#upDraftList')?.addEventListener('click', (e) => {
+    const id = e.target.closest('[data-draft-rm]')?.dataset.draftRm;
+    if (!id) return;
+    upDrafts = upDrafts.filter((d) => d.id !== id);
+    renderUpDrafts();
+  });
+  $('#upModalStart')?.addEventListener('click', () => {
+    if (!enqueueDrafts()) return;
+    closeUploadModal();
+    toast('已开始上传，可继续浏览其它页面', 'success');
+  });
+  $('#upBubble')?.addEventListener('click', () => {
+    const dock = $('#upDock');
+    setUpDock(!!dock?.classList.contains('hidden'));
+  });
+  $('#upDockClose')?.addEventListener('click', () => setUpDock(false));
+  $('#upClearDone')?.addEventListener('click', () => {
+    upJobs = upJobs.filter((j) => j.status === 'queued' || j.status === 'uploading' || j.status === 'error');
+    renderUploadChrome();
+    if (!upJobs.length) setUpDock(false);
+  });
+  $('#upDockList')?.addEventListener('click', (e) => {
+    const cancelId = e.target.closest('[data-up-cancel]')?.dataset.upCancel;
+    if (cancelId) {
+      cancelUploadJob(upJobs.find((j) => j.id === cancelId));
+      return;
+    }
+    const id = e.target.closest('[data-up-retry]')?.dataset.upRetry;
+    if (!id) return;
+    const job = upJobs.find((j) => j.id === id);
+    if (!job || job.status !== 'error') return;
+    job.status = 'queued';
+    job.progress = 0;
+    job.error = '';
+    job.cancelled = false;
+    job.uploadId = '';
+    job.abortCtrl = null;
+    renderUploadChrome();
+    pumpUploads();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!$('#upModal')?.classList.contains('hidden')) {
+      closeUploadModal();
+      return;
+    }
+    if (!$('#upDock')?.classList.contains('hidden')) setUpDock(false);
+  });
+  window.addEventListener('beforeunload', (e) => {
+    if (!hasActiveUploads()) return;
+    e.preventDefault();
+    e.returnValue = '有形象正在上传，离开页面会中断上传。';
+  });
+  window.addEventListener('pagehide', (e) => {
+    if (e.persisted) return;
+    beaconAbortUploads();
+  });
+}
+
+/* ---- Forms ---- */
 
 $('#taskForm')?.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -1765,7 +2060,9 @@ $('#taskForm')?.addEventListener('submit', async (e) => {
 });
 
 $('#btnAdminLogout')?.addEventListener('click', async () => {
-  if (!confirm('退出后需重新输入访问密钥，确定？')) return;
+  if (hasActiveUploads() && !confirm('有形象正在上传，退出会中断上传。确定退出？')) return;
+  if (!hasActiveUploads() && !confirm('退出后需重新输入访问密钥，确定？')) return;
+  try { await abortAllUploads(); } catch { /* ignore */ }
   try { sessionStorage.removeItem('dh_admin_gate_tab'); } catch { /* ignore */ }
   try {
     await fetch(API + '/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
@@ -1879,9 +2176,12 @@ function openLightbox(src, title, fallbackSrc = '') {
   if (!src) return;
   $('#lbTitle').textContent = title || '';
   const v = $('#lbVideo');
-  v.setAttribute('playsinline', '');
+    v.setAttribute('playsinline', '');
   v.setAttribute('webkit-playsinline', '');
   v.playsInline = true;
+  const avatarPreview = /\/api\/characters\/[^/]+\/video(?:\?|$)/.test(src);
+  v.muted = avatarPreview;
+  v.loop = avatarPreview;
   // Reset previous error handlers / src before assigning
   v.onerror = null;
   v.removeAttribute('src');
@@ -2023,10 +2323,6 @@ document.querySelector('#audioDrop input')?.addEventListener('change', async (e)
   }
 });
 
-document.querySelector('#avatarDrop input')?.addEventListener('change', (e) => {
-  onAvatarVideoPicked(e.target.files?.[0] || null);
-});
-
 function renderSettings() {
   checkReady();
 }
@@ -2102,6 +2398,7 @@ async function init() {
 
   await loadAvatarsData();
   await loadTasksAndRender(true);
+  bindUploadUi();
   let syncUploadPanelTimer;
   let worksResizeTimer;
   window.addEventListener('resize', () => {

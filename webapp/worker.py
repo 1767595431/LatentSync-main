@@ -29,7 +29,7 @@ from .gpu_runtime import (
     job_id_from_pid,
     write_status,
 )
-from .media import ensure_preview as write_preview_mp4, ffmpeg_preview_video
+from .media import ensure_preview as write_preview_mp4, ffmpeg_preview_video, preview_is_current
 
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
@@ -261,7 +261,7 @@ def prepare_character(character_id: str) -> None:
                         "UPDATE characters SET progress = ? WHERE id = ?",
                         ("已是 25fps，跳过转码", character_id),
                     )
-                shutil.copy2(source, video_out)
+                _ffmpeg_copy_silent(source, video_out)
             else:
                 with db.db() as conn:
                     conn.execute(
@@ -319,7 +319,7 @@ def ensure_preview(character_id: str) -> None:
     if not video or not video.exists():
         return
     preview_out = Path(char["preview_path"]) if char.get("preview_path") else video.parent / "preview.mp4"
-    if preview_out.exists() and preview_out.stat().st_size >= 1000:
+    if preview_is_current(preview_out):
         with db.db() as conn:
             conn.execute(
                 "UPDATE characters SET preview_path = ? WHERE id = ? AND (preview_path IS NULL OR preview_path = '')",
@@ -378,6 +378,29 @@ def _extract_poster(src: Path, dst: Path) -> None:
     )
 
 
+def _ffmpeg_copy_silent(src: Path, dst: Path) -> None:
+    """Keep original video bitstream, drop audio so 形象预览不会出声。"""
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(src),
+                "-c:v",
+                "copy",
+                "-an",
+                str(dst),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        _ffmpeg_prepare_video(src, dst)
+
+
 def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
     subprocess.run(
         [
@@ -390,6 +413,8 @@ def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
             str(src),
             "-r",
             str(TARGET_FPS),
+            "-vf",
+            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
             "-pix_fmt",
             "yuv420p",
             "-c:v",
@@ -454,6 +479,12 @@ def _loop() -> None:
             except Exception:
                 pass
             time.sleep(2)
+        try:
+            from .avatars import purge_stale_uploads
+
+            purge_stale_uploads()
+        except Exception:
+            pass
         time.sleep(1)
 
 
@@ -499,7 +530,7 @@ def _pick_character_needing_preview() -> Optional[str]:
         ).fetchall()
     for row in rows:
         preview = Path(row["preview_path"]) if row["preview_path"] else None
-        if preview and preview.exists() and preview.stat().st_size >= 1000:
+        if preview and preview_is_current(preview):
             continue
         video = Path(row["video_path"]) if row["video_path"] else None
         if video and video.exists():

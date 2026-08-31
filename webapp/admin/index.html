@@ -76,6 +76,10 @@
           <p id="pageDesc">最新作品与运行状态一览</p>
         </div>
         <div class="topbar-actions">
+          <button type="button" class="up-bubble hidden" id="upBubble" title="上传进度" aria-label="上传进度">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <span class="up-bubble-count" id="upBubbleCount">0</span>
+          </button>
           <span class="chip bad" id="readyChip">检测中…</span>
           <button class="btn btn-ghost btn-sm" id="btnRefresh">刷新</button>
         </div>
@@ -142,15 +146,18 @@
 
         <!-- 形象库 -->
         <section id="page-avatars" class="page">
-          <div class="avatars-split-layout">
+          <div class="avatars-full-layout">
             <div class="avatars-list-col">
-              <div class="avatar-type-tabs" id="avatarTypeTabs">
-                <button type="button" class="tab active" data-avatar-tab="public">
-                  公共形象 <span class="chip" id="avatarTabPublicCount">0</span>
-                </button>
-                <button type="button" class="tab" data-avatar-tab="private">
-                  个人形象 <span class="chip" id="avatarTabPrivateCount">0</span>
-                </button>
+              <div class="avatar-toolbar">
+                <div class="avatar-type-tabs" id="avatarTypeTabs">
+                  <button type="button" class="tab active" data-avatar-tab="public">
+                    公共形象 <span class="chip" id="avatarTabPublicCount">0</span>
+                  </button>
+                  <button type="button" class="tab" data-avatar-tab="private">
+                    个人形象 <span class="chip" id="avatarTabPrivateCount">0</span>
+                  </button>
+                </div>
+                <button type="button" class="btn btn-primary btn-sm" id="btnOpenUpload">上传形象</button>
               </div>
               <div class="avatar-private-filter hidden" id="avatarPrivateFilterWrap">
                 <input type="search" class="search-input" id="avatarPrivateSearch" placeholder="输入用户名筛选…">
@@ -159,30 +166,6 @@
               <div class="media-grid avatar-page-grid" id="avatarGrid"></div>
             </div>
             <div class="pager page-pager" id="avatarPager"></div>
-            <div class="avatars-upload-col panel sticky-panel">
-              <h3>上传新形象</h3>
-                  <p class="hint-text">支持大文件分片上传；会转成 25fps 合成素材，并另存低码率预览片供网页播放</p>
-              <form id="avatarForm">
-                <div class="field"><label>形象名称</label><input name="name" required placeholder="如：新闻主播"></div>
-                <div class="field"><label>类型</label>
-                  <select name="type" id="avatarType"><option value="public">公共</option><option value="private">个人</option></select>
-                </div>
-                <div class="field hidden" id="avatarUserWrap"><label>用户ID</label><input name="username" placeholder="如：King"></div>
-                <div class="field">
-                  <label>模板视频</label>
-                  <label class="file-drop" id="avatarDrop">
-                    <input type="file" name="video" accept="video/*" required>
-                    <div class="icon">🎬</div>
-                    <p id="avatarVideoLabel">拖拽或 <strong>点击选择</strong> 视频文件</p>
-                  </label>
-                </div>
-                <div class="upload-bar hidden" id="uploadProgress">
-                  <div class="track"><i id="uploadBar"></i></div>
-                  <p id="uploadStatus">上传中…</p>
-                </div>
-                <button type="submit" class="btn btn-primary" id="avatarSubmit" style="width:100%">上传形象</button>
-              </form>
-            </div>
           </div>
         </section>
 
@@ -272,6 +255,56 @@
       <video id="lbVideo" controls playsinline></video>
       <div class="lightbox-title" id="lbTitle"></div>
     </div>
+  </div>
+
+  <div class="up-overlay hidden" id="upModal" aria-hidden="true">
+    <div class="up-dialog" role="dialog" aria-labelledby="upModalTitle">
+      <div class="up-dialog-head">
+        <div>
+          <h3 id="upModalTitle">上传形象</h3>
+          <p>一次可选多个视频。名称默认是文件名，提交前可逐条改。开始上传后即可关掉窗口。</p>
+        </div>
+        <button type="button" class="up-x" id="upModalClose" aria-label="关闭">&times;</button>
+      </div>
+      <div class="up-meta">
+        <label>类型
+          <select id="upType">
+            <option value="public">公共</option>
+            <option value="private">个人</option>
+          </select>
+        </label>
+        <label class="hidden" id="upUserWrap">用户ID
+          <input id="upUser" placeholder="如：u1001" autocomplete="off">
+        </label>
+      </div>
+      <label class="up-drop" id="upDrop">
+        <input type="file" id="upFile" accept="video/*,.mp4,.mov,.mkv,.webm,.avi" multiple>
+        <span class="up-drop-icon">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+        </span>
+        <strong>拖入视频，或点击批量选择</strong>
+        <span>mp4 / mov / mkv / webm / avi，单文件最大 2GB</span>
+      </label>
+      <div class="up-draft" id="upDraftList"></div>
+      <div class="up-dialog-foot">
+        <span class="up-draft-meta" id="upDraftMeta"></span>
+        <div class="up-dialog-actions">
+          <button type="button" class="btn btn-ghost" id="upModalCancel">取消</button>
+          <button type="button" class="btn btn-primary" id="upModalStart" disabled>开始上传</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="up-dock hidden" id="upDock" aria-hidden="true">
+    <div class="up-dock-head">
+      <strong>上传进度</strong>
+      <div class="up-dock-actions">
+        <button type="button" class="btn btn-ghost btn-sm" id="upClearDone">清除已完成</button>
+        <button type="button" class="up-x sm" id="upDockClose" aria-label="收起">&times;</button>
+      </div>
+    </div>
+    <div class="up-dock-list" id="upDockList"></div>
   </div>
 
   <div class="toasts" id="toasts"></div>

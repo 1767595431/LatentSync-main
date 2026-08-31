@@ -78,6 +78,8 @@ http://<主机>:8811
 | `public` | 公共形象，所有对接方可列表、预览、用于合成 |
 | `private` | 个人形象，必须绑定用户 ID；只能被该用户使用 |
 
+新建形象 ID 为 **8 位**小写十六进制，例如 `a1b2c3d4`。已有长 ID 仍可继续使用。
+
 ### 1.4 形象状态
 
 请以 `bake_status` 为准。
@@ -112,7 +114,7 @@ http://<主机>:8811
 
 只接受以上三个取值。
 
-`result_path`、形象 `preview_video_path` 为**低码率预览**；原片请用下载接口。
+`result_path`、形象 `preview_video_path` 均为**低码率预览**：保持原分辨率、约 2Mbps、**静音**。原片请用下载接口。
 
 ### 1.7 素材限制
 
@@ -144,7 +146,7 @@ X-User-Id: u1001
 
 ## 2. 推荐对接流程
 
-1. `GET /api/avatars?type=public` 选用公共形象，或按 4.2 上传个人形象。
+1. `GET /api/avatars?type=public` 选用公共形象，或按 4.2 上传个人形象（多个视频可并行，见 4.2）。
 2. 个人形象上传后轮询列表，直到该条 `bake_status=ready`。
 3. `POST /api/tasks/create` 提交音频，拿到 `task_id`。
 4. `GET /api/tasks/{task_id}?username=<用户ID>` 轮询，直到 `status=done` 或 `error`。
@@ -157,7 +159,7 @@ X-User-Id: u1001
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/avatars` | 分页列出形象 |
-| POST | `/api/avatars/upload` | 分片上传形象（init / chunk / complete） |
+| POST | `/api/avatars/upload` | 分片上传形象（init / chunk / complete / abort；多文件并行即批量） |
 | POST | `/api/avatars/{identifier}/rebake` | 转码失败后重新转码 |
 | DELETE | `/api/avatars/{identifier}` | 删除形象 |
 | GET | `/api/characters/{id}/poster` | 形象封面（jpeg） |
@@ -194,8 +196,8 @@ X-User-Id: u1001
 {
   "items": [
     {
-      "identifier": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
-      "id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+      "identifier": "a1b2c3d4",
+      "id": "a1b2c3d4",
       "name": "新闻主播",
       "type": "public",
       "user_id": null,
@@ -207,10 +209,10 @@ X-User-Id: u1001
       "width": 1920,
       "height": 1080,
       "created_at": "2026-08-30T01:20:00Z",
-      "thumbnail": "/api/characters/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4/poster",
-      "preview_thumbnail": "/api/characters/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4/poster",
-      "video_path": "/api/characters/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4/video",
-      "preview_video_path": "/api/characters/a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4/video",
+      "thumbnail": "/api/characters/a1b2c3d4/poster",
+      "preview_thumbnail": "/api/characters/a1b2c3d4/poster",
+      "video_path": "/api/characters/a1b2c3d4/video",
+      "preview_video_path": "/api/characters/a1b2c3d4/video",
       "bake_status": "ready",
       "bake_progress": 100,
       "bake_message": ""
@@ -227,7 +229,7 @@ X-User-Id: u1001
 
 | 字段 | 说明 |
 |---|---|
-| `identifier` / `id` | 形象 ID，两者相同 |
+| `identifier` / `id` | 形象 ID，两者相同。新建为 **8 位**小写十六进制，例如 `a1b2c3d4` |
 | `thumbnail` / `preview_thumbnail` | 封面相对路径，未生成时为空 |
 | `video_path` / `preview_video_path` | 预览视频相对路径，未就绪时为空 |
 | `counts` / `ready_counts` | 在当前用户范围下的公共/个人数量（未传用户 ID 时个人为 0） |
@@ -258,12 +260,21 @@ curl -s "http://127.0.0.1:8811/api/avatars?type=all&username=u1001"
 
 ---
 
-### 4.2 分片上传形象
+### 4.2 分片上传形象（支持批量）
 
 `POST /api/avatars/upload`  
 `Content-Type: multipart/form-data`
 
-分三步，由 `stage` 区分：`init` → `chunk`（可多次）→ `complete`。
+**一次会话只处理一个视频。** 批量上传 = 对每个视频各自走完 `init → chunk → complete`，会话之间互不影响，可并行。
+
+建议：
+
+- 同时进行的会话不超过 **2～4** 个（过大容易打满带宽或网关超时）。
+- 每个视频单独一个 `upload_id`，名称、类型、用户 ID 按文件分别传。
+- 中途取消、失败或客户端断开：立刻调 `stage=abort` 删掉已收分片；未 abort 的半成品，服务端会在 **24 小时无新分片** 后自动清理。
+- 不要把多个视频塞进同一次 `init`。没有单独的「批量 ZIP」接口。
+
+分四步，由 `stage` 区分：`init` → `chunk`（可多次）→ `complete`。取消用 `abort`。
 
 #### 4.2.1 初始化 `stage=init`
 
@@ -290,6 +301,7 @@ curl -s "http://127.0.0.1:8811/api/avatars?type=all&username=u1001"
 | `msg` | 场景 |
 |---|---|
 | `请填写形象名称` | `name` 为空 |
+| `形象名称不能超过 80 个字符` | `name` 过长 |
 | `个人形象必须填写用户ID` | `type=private` 未传用户 ID |
 | `用户ID不能超过 64 个字符` | 超长 |
 | `用户ID无效` | 清洗后为空 |
@@ -335,7 +347,7 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 |---|---|
 | `分片参数不完整` | 缺少 `upload_id` / `chunk` / `chunk_index` |
 | `上传任务不存在` | `upload_id` 无效 |
-| `分片序号无效` | `chunk_index` 越界 |
+| `分片总数与初始化不一致` | 传了 `total_chunks` 但与 init 不一致 |
 | `空分片` | 内容为空 |
 | `分片大小应为 N 字节` | 非最后一片大小不对 |
 | `最后分片大小应为 N 字节` | 最后一片大小不对 |
@@ -367,13 +379,65 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 | `分片不完整` | 未收齐 |
 | `分片 N 文件丢失` | 分片文件缺失 |
 | `合并后文件大小与声明不一致` | 与 `filesize` 不符 |
-| `未知的上传阶段` | `stage` 不是 `init` / `chunk` / `complete` |
+| `未知的上传阶段` | `stage` 不是 `init` / `chunk` / `complete` / `abort` |
 
 ```bash
 curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
   -F stage=complete \
   -F upload_id=<上传ID>
 ```
+
+#### 4.2.4 取消并清理分片 `stage=abort`
+
+上传到一半要停、失败后放弃、或客户端断开前，请调用本阶段。会删除该 `upload_id` 下已收到的分片，不创建形象。可重复调用（幂等）。
+
+Form 与 Query 两种写法等价（关页时可用 Query，避免 multipart 发不出去）：
+
+```http
+POST /api/avatars/upload
+Content-Type: multipart/form-data
+stage=abort&upload_id=<上传ID>
+```
+
+```http
+POST /api/avatars/upload?stage=abort&upload_id=<上传ID>
+```
+
+| 参数 | 类型 | 必填 |
+|---|---|---|
+| `stage` | string | `abort` |
+| `upload_id` | string | 是 |
+
+成功 `msg`：`已取消并清理分片`。
+
+| `msg` | 场景 |
+|---|---|
+| `缺少 upload_id` | 未传 |
+| `上传任务不存在` | ID 格式无效 |
+
+```bash
+curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+  -F stage=abort \
+  -F upload_id=<上传ID>
+```
+
+#### 4.2.5 批量上传示例
+
+两个视频并行（各自独立会话）：
+
+```bash
+# 视频 A
+curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+  -F stage=init -F name=主播A -F type=private -F username=u1001 \
+  -F filename=a.mp4 -F filesize=$(stat -c%s a.mp4) -F chunk_size=8388608
+
+# 视频 B（可同时发）
+curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+  -F stage=init -F name=主播B -F type=private -F username=u1001 \
+  -F filename=b.mp4 -F filesize=$(stat -c%s b.mp4) -F chunk_size=8388608
+```
+
+分别对返回的两个 `upload_id` 上传分片并 `complete`。全部进入转码后，用 4.1 按用户 ID 轮询，直到各条 `bake_status=ready`。
 
 ---
 
@@ -390,7 +454,7 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
   "code": 0,
   "msg": "已重新排队转码",
   "success": true,
-  "data": { "identifier": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4" }
+  "data": { "identifier": "a1b2c3d4" }
 }
 ```
 
@@ -451,7 +515,7 @@ curl -o poster.jpg "http://127.0.0.1:8811/api/characters/<形象ID>/poster?user_
 
 `GET /api/characters/{id}/video`
 
-鉴权同 5.1。成功：`Content-Type: video/mp4`（低码率预览，若尚未生成预览则可能是转码后的形象视频）。
+鉴权同 5.1。成功：`Content-Type: video/mp4`。为原分辨率、约 2Mbps、静音的预览；预览尚未生成时返回 404，不会回退到带声音的原片。
 
 失败：HTTP `404`，`detail` 为 `形象不存在` 或 `形象视频不存在`。
 
@@ -610,7 +674,7 @@ curl -s -X POST "http://127.0.0.1:8811/api/tasks/<作品ID>/retry?username=u1001
 
 使用了**个人形象**的作品必须带请求头 `X-User-Id`。裸 URL、分享链接、`?user_id=` 均无法打开。
 
-成功：HTTP `200`，`Content-Type: video/mp4`。个人成片带 `Cache-Control: private, no-store`。
+成功：HTTP `200`，`Content-Type: video/mp4`。与形象预览相同：原分辨率、约 2Mbps、静音。个人成片带 `Cache-Control: private, no-store`。原片请用 6.6 下载。
 
 | HTTP | `detail` | 场景 |
 |---|---|---|
@@ -673,3 +737,4 @@ curl -s -X DELETE "http://127.0.0.1:8811/api/tasks/<作品ID>?username=u1001"
 3. 个人媒体必须由你们的服务端加 `X-User-Id` 拉取，不要把可打开的文件地址交给最终用户去分享。
 4. `identifier` 与 `id`、`username` 与 `user_id`、`thumbnail` 与 `preview_thumbnail`、`video_path` 与 `preview_video_path`、`result_path` 与 `result_path_lbr` 为同一数据的别名，任意取一个即可。
 5. 相对路径需拼在 Base URL 后；若部署带了路径前缀，前缀加在主机之后、`/api` 之前。
+6. 批量上传请按文件并行调用 4.2，不要自行拼接多文件 multipart。中途放弃必须 `abort`；未完成的分片超过 24 小时无活动会被服务端删除。
