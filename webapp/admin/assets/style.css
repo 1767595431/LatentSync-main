@@ -1927,6 +1927,31 @@ body::before {
   }
 }
 
+/* 轮询静默刷新：禁止入场动画/卡片过渡，避免每次请求整页闪一遍。
+   不关掉 badge-run / badge-bake 等持续脉冲，否则每轮轮询会把脉冲掐断再重开。 */
+html.fx-silent .animate__animated {
+  animation: none !important;
+  animation-delay: 0s !important;
+}
+html.fx-silent .media-card,
+html.fx-silent .work-card,
+html.fx-silent .stat-pill,
+html.fx-silent .empty-state,
+html.fx-silent .play-fab,
+html.fx-silent .pager,
+html.fx-silent .page,
+html.fx-silent .btn,
+html.fx-silent .health-chip,
+html.fx-silent .home-filter-grid {
+  transition: none !important;
+}
+html.fx-silent .progress-ring .bar i,
+html.fx-silent .work-progress .bar i,
+html.fx-silent .avatar-bake-progress .bake-bar i,
+html.fx-silent .bake-bar i {
+  transition: none !important;
+}
+
 .health-chips {
   display: flex;
   flex-wrap: wrap;

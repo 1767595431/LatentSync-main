@@ -1,4 +1,7 @@
 #!/bin/bash
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+export PYTHONPATH="${ROOT}:${ROOT}/upstream:${PYTHONPATH:-}"
 
 python -m preprocess.data_processing_pipeline \
     --total_num_workers 96 \

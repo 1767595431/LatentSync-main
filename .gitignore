@@ -87,7 +87,7 @@ node_modules/
 
 # 仓库内需要保留的静态资源
 !/latentsync/utils/mask*.png
-!/assets/**
-!/docs/**
+!/upstream/assets/**
+!/upstream/docs/**
 !/internal/*.png
 !/webapp/admin/assets/**

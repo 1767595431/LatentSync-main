@@ -1,3 +1,4 @@
+import copy
 import json
 import math
 import secrets
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field
 from . import avatars, db, tasks
 from .config import (
     ADMIN_COOKIE,
-    ADMIN_KEY,
+    admin_key,
     SESSION_IDLE_SECONDS,
     ALLOWED_STEPS,
     AUDIO_EXTS,
@@ -37,22 +38,42 @@ from .progress import (
     estimate_seconds,
     probe_duration,
 )
-from .worker import start_worker
+from .media import ensure_preview as write_preview_mp4
+from .prefix import cookie_path, public_prefix, split_public_path
+
+
+class PublicPrefixMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in {"http", "websocket"}:
+            path = scope.get("path") or "/"
+            prefix, _inner = split_public_path(path)
+            if prefix:
+                existing = (scope.get("root_path") or "").rstrip("/")
+                scope["root_path"] = existing + prefix
+                if path.rstrip("/") == prefix and not path.endswith("/"):
+                    scope["path"] = prefix + "/"
+        await self.app(scope, receive, send)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    # API process: no worker start/stop, never kill inference.
     ensure_dirs()
     db.init_db()
-    start_worker()
     yield
 
 
 app = FastAPI(
     title="QeMix数字人平台",
-    description="形象管理与口型合成接口。形象分公共和个人，个人形象必须带用户ID。",
+    description="形象管理与口型合成接口。个人库素材和成片不可通过分享或裸访问 URL 打开。",
     version="1.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
     openapi_tags=[
         {"name": "形象", "description": "公共形象与个人形象"},
         {"name": "作品", "description": "口型合成任务"},
@@ -62,7 +83,9 @@ app = FastAPI(
     swagger_ui_parameters={"docExpansion": "list", "defaultModelsExpandDepth": -1},
     generate_unique_id_function=lambda route: route.summary or route.name,
 )
+app.add_middleware(PublicPrefixMiddleware)
 ADMIN_DIR = WEBAPP_DIR / "admin"
+_BASE_JS = (ADMIN_DIR / "assets" / "base.js").read_text(encoding="utf-8")
 _SESSIONS: dict[str, float] = {}
 
 
@@ -82,13 +105,13 @@ def _session_ok(token: Optional[str], touch: bool = False) -> bool:
     return True
 
 
-def _set_session_cookie(response: Response, token: str) -> None:
+def _set_session_cookie(response: Response, token: str, path: str = "/") -> None:
     response.set_cookie(
         ADMIN_COOKIE,
         token,
         httponly=True,
         samesite="lax",
-        path="/",
+        path=path,
         max_age=SESSION_IDLE_SECONDS,
     )
 
@@ -99,6 +122,95 @@ def ok(data=None, msg: str = "ok"):
 
 def fail(msg: str, code: int = 1):
     return JSONResponse({"code": code, "msg": msg, "success": False, "data": None})
+
+
+def _is_admin(request: Optional[Request]) -> bool:
+    if request is None:
+        return False
+    return _session_ok(request.cookies.get(ADMIN_COOKIE), touch=False)
+
+
+def _owner_of(user_id: Optional[str] = None, username: Optional[str] = None) -> Optional[str]:
+    try:
+        return avatars.normalize_user_id(user_id) or avatars.normalize_user_id(username)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _owner_from_headers(request: Request) -> Optional[str]:
+    return _owner_of(
+        request.headers.get("x-user-id"),
+        request.headers.get("x-username"),
+    )
+
+
+def _file_owner_ok(request: Request, owner: Optional[str]) -> bool:
+    """Private media bytes: admin session cookie, or X-User-Id / X-Username header.
+
+    Query-string user_id is shareable with the URL and must never unlock files.
+    """
+    if _is_admin(request):
+        return True
+    viewer = _owner_from_headers(request)
+    return bool(owner and viewer and viewer == owner)
+
+
+def _load_character_row(character_id: str) -> dict:
+    with db.db() as conn:
+        row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "形象不存在")
+    return dict(row)
+
+
+def _visible_character(
+    character_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> dict:
+    item = _load_character_row(character_id)
+    owner = _owner_of(user_id, username)
+    if not avatars.can_view(item, owner, admin=_is_admin(request)):
+        raise HTTPException(404, "形象不存在")
+    return item
+
+
+def _visible_character_file(character_id: str, request: Request) -> dict:
+    item = _load_character_row(character_id)
+    if not avatars.is_private(item):
+        return item
+    if not _file_owner_ok(request, item.get("user_id")):
+        raise HTTPException(404, "形象不存在")
+    return item
+
+
+def _send_media(
+    path: Path,
+    media_type: str,
+    filename: Optional[str] = None,
+    *,
+    private: bool = False,
+    extra_headers: Optional[dict] = None,
+) -> FileResponse:
+    headers = dict(extra_headers or {})
+    if private:
+        headers["Cache-Control"] = "private, no-store"
+        headers["Pragma"] = "no-cache"
+        headers["X-Content-Type-Options"] = "nosniff"
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=filename,
+        headers=headers or None,
+    )
+
+
+def _assert_character_usable(char: dict, owner: Optional[str]) -> None:
+    if (char.get("type") or "public") != "private":
+        return
+    if not owner or owner != (char.get("user_id") or ""):
+        raise HTTPException(404, "形象不存在")
 
 
 class UploadInitBody(BaseModel):
@@ -284,12 +396,13 @@ def list_characters(
 
 
 @app.get("/api/characters/{character_id}")
-def get_character(character_id: str):
-    with db.db() as conn:
-        row = conn.execute("SELECT * FROM characters WHERE id = ?", (character_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "形象不存在")
-    return avatars.public_character(dict(row))
+def get_character(
+    character_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    return avatars.public_character(_visible_character(character_id, request, user_id, username))
 
 
 @app.post("/api/characters")
@@ -324,33 +437,41 @@ def create_character(body: CharacterCreateBody):
 
 
 @app.get("/api/characters/{character_id}/poster")
-def character_poster(character_id: str):
-    with db.db() as conn:
-        row = conn.execute("SELECT poster_path FROM characters WHERE id = ?", (character_id,)).fetchone()
-    if row is None or not row["poster_path"] or not Path(row["poster_path"]).exists():
+def character_poster(character_id: str, request: Request):
+    row = _visible_character_file(character_id, request)
+    if not row.get("poster_path") or not Path(row["poster_path"]).exists():
         raise HTTPException(404, "暂无封面")
-    return FileResponse(row["poster_path"], media_type="image/jpeg")
+    return _send_media(
+        Path(row["poster_path"]),
+        "image/jpeg",
+        private=avatars.is_private(row),
+    )
 
 
 @app.get("/api/characters/{character_id}/video")
-def character_video(character_id: str):
-    with db.db() as conn:
-        row = conn.execute(
-            "SELECT video_path, preview_path FROM characters WHERE id = ?",
-            (character_id,),
-        ).fetchone()
-    if row is None:
-        raise HTTPException(404, "形象不存在")
-    preview = Path(row["preview_path"]) if row["preview_path"] else None
-    full = Path(row["video_path"]) if row["video_path"] else None
+def character_video(character_id: str, request: Request):
+    row = _visible_character_file(character_id, request)
+    preview = Path(row["preview_path"]) if row.get("preview_path") else None
+    full = Path(row["video_path"]) if row.get("video_path") else None
     path = preview if preview and preview.exists() else full
     if path is None or not path.exists():
         raise HTTPException(404, "形象视频不存在")
-    return FileResponse(path, media_type="video/mp4", filename=f"{character_id}.mp4")
+    return _send_media(
+        path,
+        "video/mp4",
+        filename=f"{character_id}.mp4",
+        private=avatars.is_private(row),
+    )
 
 
 @app.delete("/api/characters/{character_id}")
-def delete_character(character_id: str):
+def delete_character(
+    character_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    _visible_character(character_id, request, user_id, username)
     with db.db() as conn:
         busy = conn.execute(
             "SELECT id FROM jobs WHERE character_id = ? AND status IN ('queued', 'running')",
@@ -368,6 +489,7 @@ def delete_character(character_id: str):
 
 @app.get("/api/avatars")
 def list_avatars(
+    request: Request,
     type: Optional[str] = None,
     username: Optional[str] = None,
     user_id: Optional[str] = None,
@@ -382,9 +504,12 @@ def list_avatars(
         except ValueError as exc:
             return fail(str(exc))
     try:
+        owner = _owner_of(user_id, username)
         with db.db() as conn:
             rows = avatars.list_characters(conn, avatar_type, user_id, username, bake_status)
-            total_counts, ready_counts = avatars.counts(conn)
+            total_counts, ready_counts = avatars.counts(
+                conn, owner, include_all_private=_is_admin(request)
+            )
     except ValueError as exc:
         return fail(str(exc))
     page_data = avatars.paginate(rows, page, page_size)
@@ -506,16 +631,21 @@ async def upload_avatar(
 
 
 @app.post("/api/avatars/{identifier}/rebake")
-def rebake_avatar(identifier: str):
+def rebake_avatar(
+    identifier: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        char = _visible_character(identifier, request, user_id, username)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "形象不存在")
+    for key in ("video_path", "preview_path"):
+        path = Path(char[key]) if char.get(key) else None
+        if path and path.exists():
+            path.unlink(missing_ok=True)
     with db.db() as conn:
-        row = conn.execute("SELECT * FROM characters WHERE id = ?", (identifier,)).fetchone()
-        if row is None:
-            return fail("形象不存在")
-        char = dict(row)
-        for key in ("video_path", "preview_path"):
-            path = Path(char[key]) if char.get(key) else None
-            if path and path.exists():
-                path.unlink(missing_ok=True)
         conn.execute(
             """
             UPDATE characters
@@ -528,7 +658,16 @@ def rebake_avatar(identifier: str):
 
 
 @app.delete("/api/avatars/{identifier}")
-def delete_avatar(identifier: str):
+def delete_avatar(
+    identifier: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        _visible_character(identifier, request, user_id, username)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "形象不存在")
     with db.db() as conn:
         busy = conn.execute(
             "SELECT id FROM jobs WHERE character_id = ? AND status IN ('queued', 'running')",
@@ -536,17 +675,25 @@ def delete_avatar(identifier: str):
         ).fetchone()
         if busy:
             return fail("该形象还有排队或正在合成的任务")
-        row = conn.execute("SELECT * FROM characters WHERE id = ?", (identifier,)).fetchone()
-        if row is None:
-            return fail("形象不存在")
         conn.execute("DELETE FROM characters WHERE id = ?", (identifier,))
     shutil.rmtree(STORAGE / "characters" / identifier, ignore_errors=True)
     return ok({"identifier": identifier}, "已删除")
 
 
 @app.get("/api/jobs")
-def list_jobs():
-    return JSONResponse(_load_jobs(), headers={"Cache-Control": "no-store"})
+def list_jobs(
+    request: Request,
+    username: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    owner = _owner_of(user_id, username)
+    with db.db() as conn:
+        items = tasks.filter_jobs(
+            tasks.load_jobs(conn),
+            username=owner,
+            include_private=_is_admin(request) and not owner,
+        )
+    return JSONResponse(items, headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/jobs")
@@ -561,6 +708,8 @@ def create_job(body: JobCreateBody):
         char = dict(char)
         if char["status"] != "ready":
             raise HTTPException(400, "形象还在转码，请稍后再提交")
+        owner = _owner_of(None, body.username)
+        _assert_character_usable(char, owner)
         upload = conn.execute("SELECT * FROM uploads WHERE id = ?", (body.audio_upload_id,)).fetchone()
         if upload is None:
             raise HTTPException(400, "音频上传不存在")
@@ -608,12 +757,14 @@ def create_job(body: JobCreateBody):
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
-    jobs = _load_jobs()
-    for job in jobs:
-        if job["id"] == job_id:
-            return JSONResponse(job, headers={"Cache-Control": "no-store"})
-    raise HTTPException(404, "任务不存在")
+def get_job(
+    job_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    job = _visible_job(job_id, request, user_id, username)
+    return JSONResponse(job, headers={"Cache-Control": "no-store"})
 
 
 def _load_jobs() -> list[dict]:
@@ -621,45 +772,160 @@ def _load_jobs() -> list[dict]:
         return tasks.load_jobs(conn)
 
 
-def _admin_tasks(username: Optional[str] = None, status: Optional[str] = None, keyword: Optional[str] = None) -> list[dict]:
+def _find_job(job_id: str) -> dict:
     with db.db() as conn:
-        jobs = tasks.filter_jobs(tasks.load_jobs(conn), username=username, status=status, keyword=keyword)
-        chars = tasks.character_map(conn)
-    return [tasks.to_admin_task(job, chars.get(job.get("character_id"))) for job in jobs]
-
-
-def _job_video(job_id: str) -> Path:
-    with db.db() as conn:
-        row = conn.execute("SELECT status, output_path FROM jobs WHERE id = ?", (job_id,)).fetchone()
-    if row is None:
+        jobs = [j for j in tasks.load_jobs(conn) if j["id"] == job_id]
+    if not jobs:
         raise HTTPException(404, "任务不存在")
-    if row["status"] != "done" or not row["output_path"]:
+    return jobs[0]
+
+
+def _visible_job(
+    job_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+) -> dict:
+    job = _find_job(job_id)
+    owner = _owner_of(user_id, username)
+    if not tasks.can_view_job(job, owner, admin=_is_admin(request)):
+        raise HTTPException(404, "任务不存在")
+    return job
+
+
+def _visible_job_file(job_id: str, request: Request) -> dict:
+    job = _find_job(job_id)
+    if not tasks.job_is_private(job):
+        return job
+    owner = (job.get("username") or job.get("character_user_id") or "").strip() or None
+    if not _file_owner_ok(request, owner):
+        raise HTTPException(404, "任务不存在")
+    return job
+
+
+def _admin_tasks(
+    request: Optional[Request] = None,
+    username: Optional[str] = None,
+    status: Optional[str] = None,
+    keyword: Optional[str] = None,
+) -> list[dict]:
+    owner = username.strip() if username else None
+    with db.db() as conn:
+        jobs = tasks.filter_jobs(
+            tasks.load_jobs(conn),
+            username=owner,
+            status=status,
+            keyword=keyword,
+            include_private=_is_admin(request) and not owner,
+        )
+        chars = tasks.character_map(conn)
+    visible = []
+    for job in jobs:
+        char = chars.get(job.get("character_id"))
+        if char and not avatars.can_view(char, owner, admin=_is_admin(request)):
+            continue
+        visible.append(tasks.to_admin_task(job, char))
+    return visible
+
+
+def _job_output(job: dict) -> Path:
+    if job.get("status") != "done" or not job.get("output_path"):
         raise HTTPException(400, "任务尚未合成完成")
-    path = Path(row["output_path"])
+    path = Path(job["output_path"])
     if not path.exists():
         raise HTTPException(404, "成片文件不存在")
     return path
 
 
+def _job_preview(job: dict) -> Path:
+    output = _job_output(job)
+    preview = Path(job["preview_path"]) if job.get("preview_path") else output.parent / "preview.mp4"
+    try:
+        path = write_preview_mp4(output, preview)
+        if job.get("preview_path") != str(path):
+            with db.db() as conn:
+                conn.execute("UPDATE jobs SET preview_path = ? WHERE id = ?", (str(path), job["id"]))
+        return path
+    except Exception:
+        return output
+
+
+def _requeue_job(job: dict) -> None:
+    if job["status"] == "running":
+        raise HTTPException(400, "正在合成的任务不能重试")
+    if not Path(job["audio_path"]).exists():
+        raise HTTPException(400, "音频文件已丢失，无法重试")
+    job_dir = STORAGE / "jobs" / job["id"]
+    for name in ("output.mp4", "preview.mp4"):
+        (job_dir / name).unlink(missing_ok=True)
+    duration = job.get("audio_duration") or probe_duration(job["audio_path"])
+    estimated = estimate_seconds(int(job.get("steps") or DEFAULT_STEPS), duration)
+    with db.db() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = ?, error = NULL, progress = ?, output_path = NULL, preview_path = NULL,
+                started_at = NULL, finished_at = NULL, stage = ?, progress_percent = 0,
+                remaining_seconds = ?, estimated_seconds = ?, current_chunk = NULL,
+                infer_started_at = NULL, tqdm_remaining = NULL
+            WHERE id = ?
+            """,
+            ("queued", "排队中", "queued", estimated, estimated, job["id"]),
+        )
+
+
+def _job_video(job_id: str) -> Path:
+    return _job_output(_find_job(job_id))
+
+
 @app.get("/api/jobs/{job_id}/preview")
-def preview_job(job_id: str):
-    path = _job_video(job_id)
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
-
-
-@app.get("/api/jobs/{job_id}/download")
-def download_job(job_id: str):
-    path = _job_video(job_id)
-    return FileResponse(
+def preview_job(job_id: str, request: Request):
+    job = _visible_job_file(job_id, request)
+    path = _job_preview(job)
+    return _send_media(
         path,
-        media_type="video/mp4",
-        filename=f"{job_id}.mp4",
-        headers={"Content-Disposition": f'attachment; filename="{job_id}.mp4"'},
+        "video/mp4",
+        filename=path.name,
+        private=tasks.job_is_private(job),
     )
 
 
+@app.get("/api/jobs/{job_id}/download")
+def download_job(job_id: str, request: Request):
+    job = _visible_job_file(job_id, request)
+    path = _job_output(job)
+    return _send_media(
+        path,
+        "video/mp4",
+        filename=f"{job_id}.mp4",
+        private=tasks.job_is_private(job),
+        extra_headers={"Content-Disposition": f'attachment; filename="{job_id}.mp4"'},
+    )
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(
+    job_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    job = _visible_job(job_id, request, user_id, username)
+    try:
+        _requeue_job(job)
+    except HTTPException as exc:
+        raise exc
+    return {"ok": True, "id": job_id, "status": "queued"}
+
+
 @app.delete("/api/jobs/{job_id}")
-def delete_job(job_id: str):
+def delete_job(
+    job_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    _visible_job(job_id, request, user_id, username)
     with db.db() as conn:
         row = conn.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if row is None:
@@ -672,20 +938,24 @@ def delete_job(job_id: str):
 
 
 @app.get("/api/health")
-def health():
-    from .worker import inference_running
+def health(request: Request):
+    from .gpu_runtime import gpu_snapshot, inference_running, worker_alive
 
     with db.db() as conn:
         queued = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued'").fetchone()["n"]
         running = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'").fetchone()["n"]
     jobs = _load_jobs()
     current = next((j for j in jobs if j.get("status") == "running"), None)
+    if current and tasks.job_is_private(current) and not _is_admin(request):
+        current = {"id": current["id"], "status": "running"}
     return JSONResponse(
         {
             "ok": True,
             "queued": queued,
             "running": running,
             "gpu_busy": inference_running(),
+            "gpus": gpu_snapshot(),
+            "worker_alive": worker_alive(),
             "current_job": current,
         },
         headers={"Cache-Control": "no-store"},
@@ -694,7 +964,7 @@ def health():
 
 @app.get("/api/system/ready")
 def system_ready():
-    from .worker import inference_running
+    from .gpu_runtime import gpu_snapshot, inference_running, worker_alive
 
     ffmpeg_ok = shutil.which("ffmpeg") is not None
     model_ok = UNET_CKPT.exists()
@@ -707,13 +977,15 @@ def system_ready():
                 "model": model_ok,
             },
             "gpu_busy": inference_running(),
+            "gpus": gpu_snapshot(),
+            "worker_alive": worker_alive(),
         }
     )
 
 
 @app.get("/api/system/status")
-def system_status():
-    from .worker import inference_running
+def system_status(request: Request):
+    from .gpu_runtime import gpu_snapshot, inference_running, worker_alive
 
     with db.db() as conn:
         baking = conn.execute(
@@ -722,13 +994,15 @@ def system_status():
         queued = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued'").fetchone()["n"]
         running = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status = 'running'").fetchone()["n"]
         done = conn.execute("SELECT COUNT(*) AS n FROM jobs WHERE status = 'done'").fetchone()["n"]
-        total_counts, _ready = avatars.counts(conn)
+        total_counts, _ready = avatars.counts(conn, include_all_private=_is_admin(request))
     return ok(
         {
             "baking": baking,
             "queued": queued,
             "running": running,
             "gpu_busy": inference_running(),
+            "gpus": gpu_snapshot(),
+            "worker_alive": worker_alive(),
             "avatars": {
                 "public": total_counts["public"],
                 "private": total_counts["private"],
@@ -742,6 +1016,7 @@ def system_status():
 
 @app.get("/api/tasks")
 def list_tasks(
+    request: Request,
     page: int = 1,
     page_size: int = 12,
     username: Optional[str] = None,
@@ -749,7 +1024,7 @@ def list_tasks(
     status: Optional[str] = None,
     keyword: Optional[str] = None,
 ):
-    items = _admin_tasks(username or user_id, status, keyword)
+    items = _admin_tasks(request, username or user_id, status, keyword)
     page_data = avatars.paginate(items, page, page_size)
     return ok(
         {
@@ -788,6 +1063,12 @@ async def create_task(
         char = dict(char)
         if char["status"] != "ready" or not char.get("video_path"):
             return fail("形象还在转码，请稍后再提交")
+        try:
+            _assert_character_usable(char, avatars.normalize_user_id(owner))
+        except HTTPException:
+            return fail("形象不存在")
+        except ValueError as exc:
+            return fail(str(exc))
     data = await audio.read()
     if not data:
         return fail("音频文件为空")
@@ -826,69 +1107,77 @@ async def create_task(
                 name,
             ),
         )
-    created = next((t for t in _admin_tasks() if t["task_id"] == job_id), None)
+    created = next((t for t in _admin_tasks(username=owner) if t["task_id"] == job_id), None)
     return ok(created, "已加入合成队列")
 
 
 @app.get("/api/tasks/{task_id}")
-def get_task(task_id: str):
-    for item in _admin_tasks():
-        if item["task_id"] == task_id:
-            return ok(item)
-    return fail("任务不存在")
+def get_task(
+    task_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        job = _visible_job(task_id, request, user_id, username)
+    except HTTPException:
+        return fail("任务不存在")
+    with db.db() as conn:
+        chars = tasks.character_map(conn)
+    return ok(tasks.to_admin_task(job, chars.get(job.get("character_id"))))
 
 
 @app.post("/api/tasks/{task_id}/retry")
-def retry_task(task_id: str):
-    with db.db() as conn:
-        row = conn.execute("SELECT * FROM jobs WHERE id = ?", (task_id,)).fetchone()
-        if row is None:
-            return fail("任务不存在")
-        job = dict(row)
-        if job["status"] == "running":
-            return fail("正在合成的任务不能重试")
-        if not Path(job["audio_path"]).exists():
-            return fail("音频文件已丢失，无法重试")
-        duration = job.get("audio_duration") or probe_duration(job["audio_path"])
-        estimated = estimate_seconds(int(job.get("steps") or DEFAULT_STEPS), duration)
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, error = NULL, progress = ?, output_path = NULL, started_at = NULL, finished_at = NULL,
-                stage = ?, progress_percent = 0, remaining_seconds = ?, estimated_seconds = ?,
-                current_chunk = NULL, infer_started_at = NULL, tqdm_remaining = NULL
-            WHERE id = ?
-            """,
-            ("queued", "排队中", "queued", estimated, estimated, task_id),
-        )
+def retry_task(
+    task_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        job = _visible_job(task_id, request, user_id, username)
+        _requeue_job(job)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "无法重试")
     return ok({"task_id": task_id}, "已重新排队")
 
 
 @app.get("/api/tasks/{task_id}/preview")
-def preview_task(task_id: str):
-    try:
-        path = _job_video(task_id)
-    except HTTPException as exc:
-        return fail(exc.detail if isinstance(exc.detail, str) else "成片不可用")
-    return FileResponse(path, media_type="video/mp4", filename=path.name)
+def preview_task(task_id: str, request: Request):
+    job = _visible_job_file(task_id, request)
+    path = _job_preview(job)
+    return _send_media(
+        path,
+        "video/mp4",
+        filename=path.name,
+        private=tasks.job_is_private(job),
+    )
 
 
 @app.get("/api/tasks/{task_id}/download")
-def download_task(task_id: str):
-    try:
-        path = _job_video(task_id)
-    except HTTPException as exc:
-        return fail(exc.detail if isinstance(exc.detail, str) else "成片不可用")
-    return FileResponse(
+def download_task(task_id: str, request: Request):
+    job = _visible_job_file(task_id, request)
+    path = _job_output(job)
+    return _send_media(
         path,
-        media_type="video/mp4",
+        "video/mp4",
         filename=f"{task_id}.mp4",
-        headers={"Content-Disposition": f'attachment; filename="{task_id}.mp4"'},
+        private=tasks.job_is_private(job),
+        extra_headers={"Content-Disposition": f'attachment; filename="{task_id}.mp4"'},
     )
 
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: str):
+def delete_task(
+    task_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        _visible_job(task_id, request, user_id, username)
+    except HTTPException:
+        return fail("任务不存在")
     with db.db() as conn:
         row = conn.execute("SELECT status FROM jobs WHERE id = ?", (task_id,)).fetchone()
         if row is None:
@@ -913,38 +1202,50 @@ def admin_session(qemix_gate: Optional[str] = Cookie(None)):
 
 
 @app.post("/api/admin/heartbeat")
-def admin_heartbeat(response: Response, qemix_gate: Optional[str] = Cookie(None)):
+def admin_heartbeat(request: Request, response: Response, qemix_gate: Optional[str] = Cookie(None)):
+    path = cookie_path(request)
     if not _session_ok(qemix_gate, touch=True):
-        response.delete_cookie(ADMIN_COOKIE, path="/")
+        response.delete_cookie(ADMIN_COOKIE, path=path)
         return fail("会话已过期，请重新登录")
-    _set_session_cookie(response, qemix_gate)
+    _set_session_cookie(response, qemix_gate, path=path)
     return ok({"ok": True, "idle_seconds": SESSION_IDLE_SECONDS})
 
 
 @app.post("/api/admin/login")
-def admin_login(body: LoginBody, response: Response):
-    if (body.key or "").strip() != ADMIN_KEY:
+def admin_login(body: LoginBody, request: Request, response: Response):
+    if (body.key or "").strip() != admin_key():
         return fail("密钥错误")
     token = secrets.token_hex(16)
     _SESSIONS[token] = time.time()
-    _set_session_cookie(response, token)
+    _set_session_cookie(response, token, path=cookie_path(request))
     return ok({"ok": True, "idle_seconds": SESSION_IDLE_SECONDS}, "已登录")
 
 
 @app.post("/api/admin/logout")
-def admin_logout(response: Response, qemix_gate: Optional[str] = Cookie(None)):
+def admin_logout(request: Request, response: Response, qemix_gate: Optional[str] = Cookie(None)):
     if qemix_gate:
         _SESSIONS.pop(qemix_gate, None)
-    response.delete_cookie(ADMIN_COOKIE, path="/")
+    response.delete_cookie(ADMIN_COOKIE, path=cookie_path(request))
     return ok({"ok": True}, "已退出")
+
+
+def _inject_base(html: str) -> str:
+    script = f"<script>{_BASE_JS}</script>"
+    if "<!--APP_BASE-->" in html:
+        return html.replace("<!--APP_BASE-->", script, 1)
+    return script + html
+
+
+def _page(name: str) -> HTMLResponse:
+    html = ADMIN_DIR / name
+    if not html.exists():
+        raise HTTPException(404, "页面缺失")
+    return HTMLResponse(_inject_base(html.read_text(encoding="utf-8")))
 
 
 @app.get("/login.html", response_class=HTMLResponse, include_in_schema=False)
 def login_page():
-    html = ADMIN_DIR / "login.html"
-    if not html.exists():
-        raise HTTPException(404, "登录页缺失")
-    return HTMLResponse(html.read_text(encoding="utf-8"))
+    return _page("login.html")
 
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
@@ -952,7 +1253,7 @@ def index():
     html = ADMIN_DIR / "index.html"
     if not html.exists():
         raise HTTPException(500, "前端页面缺失")
-    return HTMLResponse(html.read_text(encoding="utf-8"))
+    return HTMLResponse(_inject_base(html.read_text(encoding="utf-8")))
 
 
 @app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
@@ -967,6 +1268,81 @@ def favicon_svg():
     if not path.exists():
         raise HTTPException(404)
     return FileResponse(path, media_type="image/svg+xml")
+
+
+@app.get("/openapi.json", include_in_schema=False)
+def openapi_json(request: Request):
+    schema = copy.deepcopy(app.openapi())
+    prefix = public_prefix(request) or "/"
+    schema["servers"] = [{"url": prefix, "description": "QeMixAvatar"}]
+    return JSONResponse(schema)
+
+
+_SWAGGER_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>QeMixAvatar API</title>
+  <!--APP_BASE-->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+  <script>
+    const prefix = window.APP_BASE || '';
+    fetch((window.apiUrl ? window.apiUrl('/openapi.json') : (prefix + '/openapi.json')))
+      .then((r) => r.json())
+      .then((spec) => {
+        spec.servers = [{ url: prefix || '/', description: 'QeMixAvatar' }];
+        SwaggerUIBundle({
+          spec: spec,
+          dom_id: '#swagger-ui',
+          docExpansion: 'list',
+          defaultModelsExpandDepth: -1,
+          persistAuthorization: true,
+        });
+      });
+  </script>
+</body>
+</html>
+"""
+
+_REDOC_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"/>
+  <title>QeMixAvatar API</title>
+  <!--APP_BASE-->
+  <style>body { margin: 0; padding: 0; }</style>
+</head>
+<body>
+  <div id="redoc"></div>
+  <script src="https://cdn.jsdelivr.net/npm/redoc@2/bundles/redoc.standalone.js"></script>
+  <script>
+    const prefix = window.APP_BASE || '';
+    fetch((window.apiUrl ? window.apiUrl('/openapi.json') : (prefix + '/openapi.json')))
+      .then((r) => r.json())
+      .then((spec) => {
+        spec.servers = [{ url: prefix || '/', description: 'QeMixAvatar' }];
+        Redoc.init(spec, {}, document.getElementById('redoc'));
+      });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/docs", include_in_schema=False)
+@app.get("/docs/", include_in_schema=False)
+def swagger_docs():
+    return HTMLResponse(_inject_base(_SWAGGER_HTML))
+
+
+@app.get("/redoc", include_in_schema=False)
+@app.get("/redoc/", include_in_schema=False)
+def redoc_docs():
+    return HTMLResponse(_inject_base(_REDOC_HTML))
 
 
 _CN_DOCS = {
@@ -990,6 +1366,7 @@ _CN_DOCS = {
     ("DELETE", "/api/jobs/{job_id}"): ("删除合成任务", "作品"),
     ("GET", "/api/jobs/{job_id}/preview"): ("预览成片", "作品"),
     ("GET", "/api/jobs/{job_id}/download"): ("下载成片", "作品"),
+    ("POST", "/api/jobs/{job_id}/retry"): ("重试合成任务", "作品"),
     ("GET", "/api/tasks"): ("分页列出作品", "作品"),
     ("POST", "/api/tasks/create"): ("创建合成作品", "作品"),
     ("GET", "/api/tasks/{task_id}"): ("查询作品", "作品"),

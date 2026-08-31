@@ -20,12 +20,8 @@ STATUS_IN = {
     "failed": "failed",
 }
 QUALITY = {
-    20: "标准",
-    30: "标准+",
-    40: "清晰",
+    30: "标准",
     50: "高质量",
-    60: "高质量+",
-    70: "精细",
     80: "超高质量",
 }
 
@@ -78,7 +74,8 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
 def load_jobs(conn) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT jobs.*, characters.name AS character_name
+        SELECT jobs.*, characters.name AS character_name,
+               characters.type AS character_type, characters.user_id AS character_user_id
         FROM jobs
         LEFT JOIN characters ON characters.id = jobs.character_id
         ORDER BY jobs.created_at DESC
@@ -98,11 +95,14 @@ def filter_jobs(
     username: Optional[str] = None,
     status: Optional[str] = None,
     keyword: Optional[str] = None,
+    include_private: bool = False,
 ) -> list[dict]:
     items = jobs
     if username:
         key = username.strip()
         items = [j for j in items if (j.get("username") or "") == key]
+    elif not include_private:
+        items = [j for j in items if (j.get("character_type") or "public") != "private"]
     if status and status != "all":
         inner = STATUS_IN.get(status, status)
         items = [j for j in items if j.get("status") == inner]
@@ -116,3 +116,19 @@ def filter_jobs(
             or q in (j.get("character_name") or "").lower()
         ]
     return items
+
+
+def job_is_private(job: dict) -> bool:
+    return (job.get("character_type") or "public") == "private"
+
+
+def can_view_job(job: dict, owner: Optional[str], *, admin: bool = False) -> bool:
+    if admin:
+        return True
+    if not job_is_private(job):
+        return True
+    if owner and (job.get("username") or "") == owner:
+        return True
+    if owner and (job.get("character_user_id") or "") == owner:
+        return True
+    return False

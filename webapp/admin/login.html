@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
   <meta name="theme-color" content="#07080d">
   <title>QeMix数字人平台 · 访问验证</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <!--APP_BASE-->
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -150,7 +151,8 @@
     const btn = document.getElementById('submitBtn');
     const err = document.getElementById('errBox');
     const params = new URLSearchParams(location.search);
-    const next = params.get('next') || '/';
+    const u = window.apiUrl || function (p) { return p; };
+    const next = params.get('next') || u('/');
     const TAB_GATE = 'dh_admin_gate_tab';
     if (params.get('idle') === '1') {
       err.textContent = '长时间未操作，已自动退出，请重新登录';
@@ -166,7 +168,7 @@
       }
       btn.disabled = true;
       try {
-        const res = await fetch('/api/admin/login', {
+        const res = await fetch(u('/api/admin/login'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
@@ -181,7 +183,7 @@
           return;
         }
         try { sessionStorage.setItem(TAB_GATE, '1'); } catch (_) {}
-        location.replace(next.startsWith('/') ? next : '/');
+        location.replace(u(next.startsWith('/') ? next : '/'));
       } catch (ex) {
         err.textContent = '网络异常，请重试';
         btn.disabled = false;

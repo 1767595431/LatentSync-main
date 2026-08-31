@@ -1,5 +1,5 @@
 /* Digital Human Workbench */
-const API = '';
+const API = window.APP_BASE || '';
 const PAGES = {
   home: { title: '工作台', desc: '最新作品与运行状态一览' },
   works: { title: '作品库', desc: '形象 → 成品的完整合成记录' },
@@ -112,7 +112,7 @@ async function api(path, opts = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(API + path, { ...fetchOpts, signal: ctrl.signal });
+    const res = await fetch(API + path, { credentials: 'same-origin', ...fetchOpts, signal: ctrl.signal });
     if ((res.headers.get('content-type') || '').includes('json')) {
       return { ok: res.ok, data: await res.json() };
     }
@@ -130,7 +130,8 @@ async function api(path, opts = {}) {
 function mediaUrl(path) {
   if (!path) return '';
   if (path.startsWith('http://') || path.startsWith('https://')) return path;
-  let normalized = (path.startsWith('/') ? path : `/${path}`).replace(/\\/g, '/');
+  const prefixed = window.apiUrl ? window.apiUrl(path) : (API + (path.startsWith('/') ? path : `/${path}`));
+  let normalized = prefixed.replace(/\\/g, '/');
   // Idempotent encoding: callers often pass already-mediaUrl()'d paths into posterHtml.
   // Re-encoding would turn "%E6" into "%25E6" and break Chinese result thumbnails (404).
   try {
@@ -182,10 +183,21 @@ function renderPager(el, page, pages, total, pageSize) {
   el.classList.remove('hidden');
   const p = Math.max(1, page || 1);
   const pg = Math.max(1, pages || 1);
+  const key = `${p}|${pg}|${total}|${pageSize}`;
+  if (el.dataset.pagerKey === key) return;
+  el.dataset.pagerKey = key;
   el.innerHTML = `
     <button type="button" class="btn btn-ghost btn-sm" data-page="${p - 1}" ${p > 1 ? '' : 'disabled'}>上一页</button>
     <span class="pager-label">第 ${p} / ${pg} 页 · 共 ${total} 项 · 每页 ${pageSize} 条</span>
     <button type="button" class="btn btn-ghost btn-sm" data-page="${p + 1}" ${p < pg ? '' : 'disabled'}>下一页</button>`;
+}
+
+function setBarHtml(el, html) {
+  if (!el) return false;
+  if (el.dataset.staticHtml === html) return false;
+  el.dataset.staticHtml = html;
+  el.innerHTML = html;
+  return true;
 }
 
 function mergeAvatarsIntoMap(items) {
@@ -202,6 +214,11 @@ function getPrivateAvatarSearch() {
 async function fetchAvatarsPage(page, opts = {}) {
   const tab = opts.type || avatarTab;
   const p = page ?? (tab === 'public' ? avatarPublicPage : avatarPrivatePage);
+  const privQ = tab === 'private' ? (opts.username ?? getPrivateAvatarSearch()) : '';
+  if (opts.scope !== 'all' && tab === 'private' && !privQ) {
+    avatarsPageMeta = { total: 0, page: 1, pages: 1 };
+    return { items: [], total: 0, page: 1, pages: 1, page_size: opts.page_size || PAGE_SIZE.avatars };
+  }
   const params = new URLSearchParams({
     page: String(p),
     page_size: String(opts.page_size || PAGE_SIZE.avatars),
@@ -361,11 +378,14 @@ async function refreshSystemStatsQuiet() {
 }
 
 async function pollAvatarPagesQuiet() {
+  FX?.setSilent(true);
   try {
     await refreshAvatarCounts();
     if (currentPage === 'avatars') await renderAvatars({ animate: false });
     else if (currentPage === 'create') await renderCreateAvatars({ animate: false });
-  } catch { /* ignore */ }
+  } catch { /* ignore */ } finally {
+    FX?.setSilent(false);
+  }
 }
 
 async function refreshAvatarCounts() {
@@ -422,8 +442,9 @@ function renderStatsRow({ animate = true } = {}) {
 }
 
 function canPatchTaskCards(container, items) {
-  if (!container || !items.length) return false;
+  if (!container) return false;
   const cards = [...container.querySelectorAll('.media-card[data-task-id], .work-card[data-task-id]')];
+  if (!items.length) return cards.length === 0;
   if (cards.length !== items.length) return false;
   return items.every((t, i) => cards[i].dataset.taskId === t.task_id);
 }
@@ -511,7 +532,7 @@ function workCardActionsHtml(t) {
     const fb = full && full !== rv ? ` data-play-fallback="${esc(full)}"` : '';
     actions += `<button class="btn btn-primary btn-sm" data-play="${esc(rv)}"${fb} data-title="${esc(t.task_name)}">播放成品</button>`;
   }
-  if (isDone && t.result_path) actions += `<a class="btn btn-ghost btn-sm" href="/api/tasks/${esc(t.task_id)}/download" target="_blank">下载</a>`;
+  if (isDone && t.result_path) actions += `<a class="btn btn-ghost btn-sm" href="${API}/api/tasks/${esc(t.task_id)}/download" target="_blank">下载</a>`;
   if (t.status === 'error') actions += `<button class="btn btn-ghost btn-sm" data-retry="${esc(t.task_id)}">重试</button>`;
   actions += `<button class="btn btn-ghost btn-sm" data-del="${esc(t.task_id)}">删除</button>`;
   return actions;
@@ -582,34 +603,42 @@ function patchWorkCard(card, t) {
   const avatarPoster = previews[0];
   const resultPosterEl = previews[1];
   if (avatarPoster) {
-    const label = avatarPoster.querySelector('.label-tag');
-    const labelHtml = label ? label.outerHTML : '<span class="label-tag">形象</span>';
     const avThumb = avatarCoverPoster(av);
     const avPlay = avatarPreviewVideo(av);
     const avName = taskAvatarName(t, av);
     const avTitle = avatarPreviewTitle(av);
-    const inner = avThumb
-      ? posterHtml(avThumb, avName, { eager: true }) + (avPlay ? playOverlay() : '')
-      : '<div class="placeholder"><span>形象</span></div>';
-    avatarPoster.innerHTML = labelHtml + inner;
+    patchPosterImg(avatarPoster, avThumb, avName, { eager: true });
     avatarPoster.dataset.play = avPlay || '';
     avatarPoster.dataset.title = avTitle;
+    if (avPlay && !avatarPoster.querySelector('.play-fab')) {
+      avatarPoster.insertAdjacentHTML('beforeend', playOverlay());
+    }
+    if (!avPlay) avatarPoster.querySelector('.play-fab')?.remove();
   }
   if (resultPosterEl) {
-    const label = resultPosterEl.querySelector('.label-tag');
-    const labelHtml = label ? label.outerHTML : '<span class="label-tag">成品</span>';
     const rv = resultVideo(t);
     const full = resultVideoFull(t);
-    resultPosterEl.innerHTML = labelHtml + workCardResultInner(t, av);
+    const innerKey = `${t.status}|${rv || ''}|${resultCoverPoster(t, av) || ''}`;
+    if (resultPosterEl.dataset.patchKey !== innerKey) {
+      resultPosterEl.dataset.patchKey = innerKey;
+      const label = resultPosterEl.querySelector('.label-tag');
+      const labelHtml = label ? label.outerHTML : '<span class="label-tag">成品</span>';
+      resultPosterEl.innerHTML = labelHtml + workCardResultInner(t, av);
+    }
     resultPosterEl.dataset.play = t.status === 'done' && rv ? rv : '';
     if (t.status === 'done' && rv && full && full !== rv) resultPosterEl.dataset.playFallback = full;
     else delete resultPosterEl.dataset.playFallback;
     resultPosterEl.dataset.title = t.task_name || '';
   }
 
-  // Silent poll previously only refreshed badge/progress — actions stayed on "停止".
   const actionsEl = card.querySelector('.card-actions');
-  if (actionsEl) actionsEl.innerHTML = workCardActionsHtml(t);
+  if (actionsEl) {
+    const key = `${t.status}|${avatarPreviewVideo(av) || ''}|${resultVideo(t) || ''}|${t.result_path || ''}`;
+    if (actionsEl.dataset.patchKey !== key) {
+      actionsEl.dataset.patchKey = key;
+      actionsEl.innerHTML = workCardActionsHtml(t);
+    }
+  }
 }
 
 function renderHomeDefaultSections({ animate = true } = {}) {
@@ -632,10 +661,16 @@ function renderHomeDefaultSections({ animate = true } = {}) {
       ? running.map((t) => renderMediaCard(t, false)).join('')
       : '<div class="empty-state" style="padding:40px;min-width:280px"><p>当前没有进行中的任务</p></div>';
   }
-  const readyAvatars = avatarsList.filter(isAvatarReady);
-  avatarsEl.innerHTML = readyAvatars.length
-    ? readyAvatars.slice(0, 10).map((a) => renderAvatarCard(a, { compact: true })).join('')
-    : '<div class="empty-state" style="padding:40px"><p>暂无可用形象</p></div>';
+  const readyAvatars = avatarsList.filter(isAvatarReady).slice(0, 10);
+  if (!animate && canPatchAvatarGrid(avatarsEl, readyAvatars)) {
+    patchAvatarGridCards(avatarsEl, readyAvatars, { compact: true });
+  } else if (!animate && !readyAvatars.length && avatarsEl.querySelector('.empty-state') && !avatarsEl.querySelector('[data-avatar-id]')) {
+    /* keep empty */
+  } else {
+    avatarsEl.innerHTML = readyAvatars.length
+      ? readyAvatars.map((a) => renderAvatarCard(a, { compact: true })).join('')
+      : '<div class="empty-state" style="padding:40px"><p>暂无可用形象</p></div>';
+  }
   if (FX?.shouldAnimate(animate)) {
     FX.revealChildren(recentEl);
     FX.revealChildren(activeEl);
@@ -643,28 +678,48 @@ function renderHomeDefaultSections({ animate = true } = {}) {
   }
 }
 
-async function renderHomeFiltered() {
+async function getHomeFilteredModel() {
   if (homeFilter === 'done' || homeFilter === 'wait') {
     const list = homeTasksSnapshot.filter((t) => t.status === homeFilter);
-    if (!list.length) return '<div class="empty-state"><p>暂无匹配作品</p></div>';
-    return `<div class="home-filter-grid">${list.map((t) => renderWorkCard(t)).join('')}</div>`;
+    return {
+      kind: 'work',
+      items: list,
+      html: list.length
+        ? `<div class="home-filter-grid">${list.map((t) => renderWorkCard(t)).join('')}</div>`
+        : '<div class="empty-state"><p>暂无匹配作品</p></div>',
+    };
   }
   if (homeFilter === 'run') {
     const list = homeTasksSnapshot.filter((t) => t.status === 'run');
-    if (!list.length) return '<div class="empty-state"><p>暂无进行中的任务</p></div>';
-    return `<div class="home-filter-grid">${list.map((t) => renderWorkCard(t)).join('')}</div>`;
+    return {
+      kind: 'work',
+      items: list,
+      html: list.length
+        ? `<div class="home-filter-grid">${list.map((t) => renderWorkCard(t)).join('')}</div>`
+        : '<div class="empty-state"><p>暂无进行中的任务</p></div>',
+    };
   }
   if (homeFilter === 'baking') {
     const d = await fetchAvatarsPage(1, { bake_status: 'processing', scope: 'all', page_size: 50 });
     const list = d?.items || [];
-    if (!list.length) return '<div class="empty-state"><p>暂无转码中的形象</p><p class="hint-text">转码状态请在形象库查看</p></div>';
-    return `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`;
+    return {
+      kind: 'avatar',
+      items: list,
+      html: list.length
+        ? `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`
+        : '<div class="empty-state"><p>暂无转码中的形象</p><p class="hint-text">转码状态请在形象库查看</p></div>',
+    };
   }
   if (homeFilter === 'avatar-public') {
     const d = await fetchAvatarsPage(1, { type: 'public', page_size: 24 });
     const list = d?.items || [];
-    if (!list.length) return '<div class="empty-state"><p>暂无公共形象</p></div>';
-    return `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`;
+    return {
+      kind: 'avatar',
+      items: list,
+      html: list.length
+        ? `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`
+        : '<div class="empty-state"><p>暂无公共形象</p></div>',
+    };
   }
   if (homeFilter === 'avatar-private') {
     const q = ($('#homePrivateSearch')?.value || '').trim();
@@ -672,19 +727,28 @@ async function renderHomeFiltered() {
     const list = d?.items || [];
     const empty = q
       ? '<div class="empty-state"><p>未找到该用户的个人形象</p></div>'
-      : '<div class="empty-state"><p>暂无个人形象</p></div>';
-    return `<div class="section-head compact" style="margin-bottom:16px">
+      : '<div class="empty-state"><p>请输入用户ID查看个人形象，不会列出其他人的个人库</p></div>';
+    return {
+      kind: 'avatar',
+      items: list,
+      search: q,
+      html: `<div class="section-head compact" style="margin-bottom:16px">
       <input type="search" class="search-input" id="homePrivateSearch" placeholder="输入用户名筛选个人形象…" value="${esc(q)}">
-    </div>${list.length ? `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>` : empty}`;
+    </div>${list.length ? `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>` : empty}`,
+    };
   }
   if (homeFilter === 'avatar-all') {
     const pub = await fetchAvatarsPage(1, { type: 'public', page_size: 24 });
-    const priv = await fetchAvatarsPage(1, { type: 'private', page_size: 24 });
-    const list = [...(pub?.items || []), ...(priv?.items || [])];
-    if (!list.length) return '<div class="empty-state"><p>暂无形象</p></div>';
-    return `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`;
+    const list = [...(pub?.items || [])];
+    return {
+      kind: 'avatar',
+      items: list,
+      html: list.length
+        ? `<div class="home-filter-grid">${list.map((a) => renderAvatarCard(a)).join('')}</div>`
+        : '<div class="empty-state"><p>暂无公共形象</p></div>',
+    };
   }
-  return '';
+  return { kind: 'empty', items: [], html: '' };
 }
 
 function setHomeFilter(key) {
@@ -712,7 +776,29 @@ async function renderHomeContent({ animate = true } = {}) {
   const label = HOME_FILTERS[homeFilter]?.label || homeFilter;
   const el = $('#homeFilterLabel');
   if (el) el.textContent = `当前筛选：${label}`;
-  if (filteredView) filteredView.innerHTML = await renderHomeFiltered();
+  const model = await getHomeFilteredModel();
+  const ids = (model.items || []).map((it) => it.task_id || it.identifier).join(',');
+  const staticKey = `${homeFilter}|${model.kind}|${ids}|${model.search || ''}`;
+  const grid = filteredView?.querySelector('.home-filter-grid');
+  if (!animate && filteredView?.dataset.staticKey === staticKey) {
+    if (model.kind === 'work' && model.items.length && grid && canPatchTaskCards(grid, model.items)) {
+      [...grid.querySelectorAll('.work-card[data-task-id], .media-card[data-task-id]')].forEach((card, i) => {
+        const item = model.items[i];
+        if (card.classList.contains('work-card')) patchWorkCard(card, item);
+        else patchMediaCard(card, item, homeFilter === 'done');
+      });
+      return;
+    }
+    if (model.kind === 'avatar' && model.items.length && grid && canPatchAvatarGrid(grid, model.items)) {
+      patchAvatarGridCards(grid, model.items);
+      return;
+    }
+    if (!model.items.length) return;
+  }
+  if (filteredView) {
+    filteredView.dataset.staticKey = staticKey;
+    filteredView.innerHTML = model.html;
+  }
   if (FX?.shouldAnimate(animate)) {
     FX.reveal($('#homeFilterBar'), 'fadeInDown', 300);
     FX.revealChildren(filteredView);
@@ -844,10 +930,12 @@ function setupPolling() {
     pollBusy = true;
     (async () => {
       try {
+        FX?.setSilent(true);
         await checkReady();
         if (['home', 'works'].includes(currentPage)) await loadTasksAndRender(true);
         if (['avatars', 'create'].includes(currentPage)) await pollAvatarPagesQuiet();
       } finally {
+        FX?.setSilent(false);
         pollBusy = false;
       }
     })();
@@ -866,10 +954,10 @@ async function forceLogout(reason) {
   loggingOut = true;
   try { sessionStorage.removeItem('dh_admin_gate_tab'); } catch { /* ignore */ }
   try {
-    await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    await fetch(API + '/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
   } catch { /* ignore */ }
   const q = reason === 'idle' ? '?idle=1' : '';
-  location.replace(`/login.html${q}`);
+  location.replace(`${API}/login.html${q}`);
 }
 
 function bumpIdle() {
@@ -879,7 +967,7 @@ function bumpIdle() {
   const now = Date.now();
   if (now - lastHeartbeatAt < 30000) return;
   lastHeartbeatAt = now;
-  fetch('/api/admin/heartbeat', { method: 'POST', credentials: 'same-origin' })
+  fetch(API + '/api/admin/heartbeat', { method: 'POST', credentials: 'same-origin' })
     .then((res) => res.json().catch(() => ({})))
     .then((body) => {
       if (body && body.code !== 0) forceLogout('expired');
@@ -918,9 +1006,25 @@ async function checkReady() {
     $('#statusDot').className = 'status-dot ' + (ok ? 'ok' : 'bad');
     if (data?.data?.checks) {
       const labels = { ffmpeg: 'FFmpeg', gpu: 'GPU', model: '合成模型' };
-      $('#healthChips').innerHTML = Object.entries(data.data.checks)
-        .map(([k, v]) => `<span class="health-chip ${v ? 'ok' : 'fail'}">${v ? '✓' : '✗'} ${labels[k] || k}</span>`)
-        .join('');
+      setBarHtml(
+        $('#healthChips'),
+        Object.entries(data.data.checks)
+          .map(([k, v]) => `<span class="health-chip ${v ? 'ok' : 'fail'}">${v ? '✓' : '✗'} ${labels[k] || k}</span>`)
+          .join(''),
+      );
+    }
+    const gpuBox = $('#gpuChips');
+    if (gpuBox) {
+      const gpus = data?.data?.gpus || [];
+      setBarHtml(
+        gpuBox,
+        gpus.length
+          ? gpus.map((g) => {
+              const busy = !!g.busy;
+              return `<span class="health-chip ${busy ? 'fail' : 'ok'}">GPU ${g.id} ${busy ? '合成中' : '空闲'}</span>`;
+            }).join('')
+          : '<span class="health-chip fail">未配置</span>',
+      );
     }
   } catch {
     $('#readyChip').className = 'chip bad';
@@ -1082,7 +1186,9 @@ async function renderWorks({ animate = true } = {}) {
     const emptyMsg = userQ
       ? `<div class="empty-state"><div class="ico">📽</div><h3>该用户暂无作品</h3><p>用户标识「${esc(userQ)}」下没有匹配的任务</p></div>`
       : `<div class="empty-state"><div class="ico">📽</div><h3>暂无作品</h3><p>去「创建」页开始第一个合成吧</p></div>`;
-    grid.innerHTML = emptyMsg;
+    if (animate || !grid.querySelector('.empty-state') || grid.querySelector('[data-task-id]')) {
+      grid.innerHTML = emptyMsg;
+    }
     renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
     if (FX?.shouldAnimate(animate)) {
       FX.revealChildren(grid);
@@ -1143,8 +1249,9 @@ function renderAvatarBakeProgress(a) {
 }
 
 function canPatchAvatarGrid(grid, items) {
-  if (!grid || !items.length) return false;
+  if (!grid) return false;
   const cards = [...grid.querySelectorAll('.media-card[data-avatar-id]')];
+  if (!items.length) return cards.length === 0;
   if (cards.length !== items.length) return false;
   return items.every((a, i) => cards[i].dataset.avatarId === a.identifier);
 }
@@ -1193,19 +1300,54 @@ function patchAvatarGridCards(grid, items, { pickMode = false } = {}) {
     }
 
     const bakeBadgeEl = card.querySelector('[data-bake-badge]');
-    if (bakeBadgeEl) bakeBadgeEl.outerHTML = bakeBadge(a);
+    if (bakeBadgeEl) {
+      const st = BAKE[a.bake_status] || BAKE.missing;
+      const pct = a.bake_status === 'processing' ? ` ${a.bake_progress || 0}%` : '';
+      const nextText = `${st.label}${pct}`;
+      const nextCls = `badge-status ${st.cls}`;
+      if (bakeBadgeEl.className !== nextCls) bakeBadgeEl.className = nextCls;
+      if (bakeBadgeEl.textContent !== nextText) bakeBadgeEl.textContent = nextText;
+    }
 
     const body = card.querySelector('.card-body');
     const actions = body?.querySelector('.card-actions');
     if (body && actions) {
-      body.querySelector('.avatar-bake-progress')?.remove();
-      const prog = renderAvatarBakeProgress(a);
-      if (prog) actions.insertAdjacentHTML('beforebegin', prog);
+      let prog = body.querySelector('.avatar-bake-progress');
+      if (a.bake_status === 'processing') {
+        const pct = Math.max(0, Math.min(100, Number(a.bake_progress) || 0));
+        const msg = a.bake_message || '转码中…';
+        if (!prog) {
+          actions.insertAdjacentHTML('beforebegin', renderAvatarBakeProgress(a));
+        } else {
+          prog.className = 'avatar-bake-progress is-processing';
+          const bar = prog.querySelector('.bake-bar i');
+          const msgEl = prog.querySelector('.bake-msg');
+          if (bar) bar.style.width = `${pct}%`;
+          if (msgEl) {
+            const text = `${msg} · ${pct}%`;
+            if (msgEl.textContent !== text) {
+              msgEl.textContent = text;
+              msgEl.title = msg;
+            }
+          }
+        }
+      } else if (a.bake_status === 'error') {
+        const msg = a.bake_message || '转码失败，请重新上传';
+        if (!prog || !prog.classList.contains('is-error')) {
+          prog?.remove();
+          actions.insertAdjacentHTML('beforebegin', renderAvatarBakeProgress(a));
+        } else {
+          const msgEl = prog.querySelector('.bake-msg');
+          if (msgEl && msgEl.textContent !== msg) msgEl.textContent = msg;
+        }
+      } else if (prog) {
+        prog.remove();
+      }
 
       const sub = body.querySelector('.sub');
       if (sub) {
-        const base = `${esc(a.identifier)}${a.type === 'private' && a.username ? ' · ' + esc(a.username) : ''}`;
-        sub.innerHTML = base + (pv ? ' · 点击封面预览形象' : '');
+        const next = `${a.identifier}${a.type === 'private' && a.username ? ` · ${a.username}` : ''}${pv ? ' · 点击封面预览形象' : ''}`;
+        if (sub.textContent !== next) sub.textContent = next;
       }
 
       let previewBtn = actions.querySelector('button[data-play]');
@@ -1299,7 +1441,7 @@ async function renderCreateAvatars({ animate = true } = {}) {
   } else {
     grid.innerHTML = items.length
       ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
-      : `<div class="empty-state inline"><p>${privQ ? '该用户暂无可用个人形象' : '暂无可用个人形象'}</p></div>`;
+      : `<div class="empty-state inline"><p>${privQ ? '该用户暂无可用个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
   }
   renderPager($('#createAvatarPager'), page, pages, total, PAGE_SIZE.avatars);
   syncAvatarsUploadPanelHeight();
@@ -1359,7 +1501,7 @@ async function renderAvatars({ animate = true } = {}) {
   } else {
     grid.innerHTML = items.length
       ? items.map((a) => renderAvatarCard(a)).join('')
-      : `<div class="empty-state inline"><p>${privQ ? '未找到该用户的个人形象' : '暂无个人形象'}</p></div>`;
+      : `<div class="empty-state inline"><p>${privQ ? '未找到该用户的个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
   }
   renderPager($('#avatarPager'), page, pages, total, PAGE_SIZE.avatars);
   syncAvatarsUploadPanelHeight();
@@ -1604,7 +1746,7 @@ $('#taskForm')?.addEventListener('submit', async (e) => {
   }
   const fd = new FormData(form);
   fd.set('avatar_identifier', pickedAvatarId);
-  const steps = form.querySelector('input[name="steps"]:checked')?.value || '20';
+  const steps = form.querySelector('input[name="steps"]:checked')?.value || '30';
   fd.set('steps', steps);
   $('#taskSubmit').disabled = true;
   try {
@@ -1626,9 +1768,9 @@ $('#btnAdminLogout')?.addEventListener('click', async () => {
   if (!confirm('退出后需重新输入访问密钥，确定？')) return;
   try { sessionStorage.removeItem('dh_admin_gate_tab'); } catch { /* ignore */ }
   try {
-    await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
+    await fetch(API + '/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
   } catch { /* ignore */ }
-  location.replace('/login.html');
+  location.replace(API + '/login.html');
 });
 
 /* ---- Task log viewer ---- */
@@ -1670,9 +1812,10 @@ async function refreshTaskLogView() {
     if (footer) {
       const live = d.task_status === 'run' || d.task_status === 'wait';
       const path = d.log_path || '—';
-      footer.innerHTML = live
+      const html = live
         ? `<span class="task-log-live">实时刷新中</span> · ${esc(path)}${d.updated_at ? ` · 进度更新 ${esc(d.updated_at)}` : ''}`
         : `${esc(path)}${d.updated_at ? ` · 最后更新 ${esc(d.updated_at)}` : ''}`;
+      setBarHtml(footer, html);
     }
     if ($('#taskLogAutoScroll')?.checked && (wasAtBottom || d.task_status === 'run')) {
       pre.scrollTop = pre.scrollHeight;

@@ -61,10 +61,23 @@ def public_character(row: dict) -> dict:
     return item
 
 
+def is_private(row: dict) -> bool:
+    return (row.get("type") or "public") == "private"
+
+
+def can_view(row: dict, owner: Optional[str], *, admin: bool = False) -> bool:
+    if admin:
+        return True
+    if not is_private(row):
+        return True
+    return bool(owner) and owner == (row.get("user_id") or "")
+
+
 def to_admin_avatar(row: dict) -> dict:
     item = public_character(row)
     cid = item["id"]
     ready = item.get("status") == "ready" and bool(item.get("video_path"))
+    # Never put user_id on media URLs: a shareable query string must not unlock private bytes.
     poster = f"/api/characters/{cid}/poster" if item.get("poster_path") else ""
     video = f"/api/characters/{cid}/video" if ready else ""
     owner = item.get("user_id")
@@ -99,15 +112,24 @@ def list_characters(
     username: Optional[str] = None,
     bake_status_filter: Optional[str] = None,
 ) -> list[dict]:
-    sql = "SELECT * FROM characters WHERE 1=1"
-    args: list[Any] = []
-    if avatar_type in AVATAR_TYPES:
-        sql += " AND COALESCE(type, 'public') = ?"
-        args.append(avatar_type)
     owner = normalize_user_id(user_id) or normalize_user_id(username)
-    if avatar_type == "private" and owner:
-        sql += " AND user_id = ?"
-        args.append(owner)
+    if avatar_type == "private":
+        if not owner:
+            raise ValueError("查询个人形象必须填写用户ID")
+        sql = "SELECT * FROM characters WHERE COALESCE(type, 'public') = 'private' AND user_id = ?"
+        args: list[Any] = [owner]
+    elif avatar_type == "public":
+        sql = "SELECT * FROM characters WHERE COALESCE(type, 'public') = 'public'"
+        args = []
+    elif owner:
+        sql = (
+            "SELECT * FROM characters WHERE COALESCE(type, 'public') = 'public' "
+            "OR (COALESCE(type, 'public') = 'private' AND user_id = ?)"
+        )
+        args = [owner]
+    else:
+        sql = "SELECT * FROM characters WHERE COALESCE(type, 'public') = 'public'"
+        args = []
     sql += " ORDER BY created_at DESC"
     rows = [public_character(dict(r)) for r in conn.execute(sql, args).fetchall()]
     if bake_status_filter:
@@ -115,11 +137,17 @@ def list_characters(
     return rows
 
 
-def counts(conn) -> tuple[dict[str, int], dict[str, int]]:
+def counts(conn, owner: Optional[str] = None, *, include_all_private: bool = False) -> tuple[dict[str, int], dict[str, int]]:
     total = {"public": 0, "private": 0}
     ready = {"public": 0, "private": 0}
-    for row in conn.execute("SELECT type, status FROM characters").fetchall():
+    owner = normalize_user_id(owner) if owner else None
+    for row in conn.execute("SELECT type, status, user_id FROM characters").fetchall():
         kind = row["type"] if row["type"] in AVATAR_TYPES else "public"
+        if kind == "private":
+            if include_all_private:
+                pass
+            elif not owner or row["user_id"] != owner:
+                continue
         total[kind] += 1
         if row["status"] == "ready":
             ready[kind] += 1

@@ -132,9 +132,9 @@ with gr.Blocks(title="LatentSync demo") as demo:
 
             gr.Examples(
                 examples=[
-                    ["assets/demo1_video.mp4", "assets/demo1_audio.wav"],
-                    ["assets/demo2_video.mp4", "assets/demo2_audio.wav"],
-                    ["assets/demo3_video.mp4", "assets/demo3_audio.wav"],
+                    ["upstream/assets/demo1_video.mp4", "upstream/assets/demo1_audio.wav"],
+                    ["upstream/assets/demo2_video.mp4", "upstream/assets/demo2_audio.wav"],
+                    ["upstream/assets/demo3_video.mp4", "upstream/assets/demo3_audio.wav"],
                 ],
                 inputs=[video_input, audio_input],
             )

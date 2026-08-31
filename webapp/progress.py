@@ -228,7 +228,7 @@ STREAM_RE = re.compile(
 PLAN_RE = re.compile(r"Inference plan:\s+(\d+) chunks")
 
 
-def parse_job_line(line: str, steps: int = 20) -> Optional[dict[str, Any]]:
+def parse_job_line(line: str, steps: int = 30) -> Optional[dict[str, Any]]:
     text = (line or "").replace("\r", "").strip()
     if not text:
         return None

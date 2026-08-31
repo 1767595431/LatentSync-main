@@ -6,8 +6,8 @@ data:
   audio_embeds_cache_dir: /mnt/bn/maliva-gen-ai-v2/chunyu.li/audio_cache/embeds
   audio_mel_cache_dir: /mnt/bn/maliva-gen-ai-v2/chunyu.li/audio_cache/mel
 
-  val_video_path: assets/demo1_video.mp4
-  val_audio_path: assets/demo1_audio.wav
+  val_video_path: upstream/assets/demo1_video.mp4
+  val_audio_path: upstream/assets/demo1_audio.wav
   batch_size: 1 # 8
   num_workers: 12 # 12
   num_frames: 16

@@ -15,9 +15,11 @@ def utcnow() -> str:
 
 def connect() -> sqlite3.Connection:
     ensure_dirs()
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(DB_PATH), timeout=15, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -85,6 +87,7 @@ def init_db() -> None:
                     progress_updated_at TEXT,
                     username TEXT,
                     task_name TEXT,
+                    preview_path TEXT,
                     FOREIGN KEY (character_id) REFERENCES characters(id)
                 );
                 """
@@ -115,6 +118,7 @@ def init_db() -> None:
                 ("progress_updated_at", "TEXT"),
                 ("username", "TEXT"),
                 ("task_name", "TEXT"),
+                ("preview_path", "TEXT"),
             ):
                 if name not in existing:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {typ}")
@@ -125,16 +129,15 @@ def init_db() -> None:
 
 @contextmanager
 def db() -> Iterator[sqlite3.Connection]:
-    with _lock:
-        conn = connect()
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    conn = connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[dict[str, Any]]:

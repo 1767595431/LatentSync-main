@@ -13,6 +13,7 @@
       if (on) this._silentDepth += 1;
       else this._silentDepth = Math.max(0, this._silentDepth - 1);
       this.silent = this._silentDepth > 0;
+      document.documentElement.classList.toggle('fx-silent', this.silent);
     },
 
     shouldAnimate(prefer = true) {

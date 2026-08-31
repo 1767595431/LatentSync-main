@@ -1,0 +1,12 @@
+# 服务配置（改 host/port 后需重新 python start.py）
+host: 0.0.0.0
+port: 8811
+
+# 网页访问密钥
+admin_key: King
+
+# 合成用的 GPU 编号，与 nvidia-smi 一致。改完一般马上生效，正在跑的任务不受影响。
+# 单卡：     gpus: [0]
+# 多卡并行： gpus: [0, 1]   （每张卡同时只跑一条）
+# 也可以写成：gpus: 0,1
+gpus: [0]

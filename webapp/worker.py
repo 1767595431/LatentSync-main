@@ -1,47 +1,159 @@
+import fcntl
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Optional
 
 from . import db
-from .config import GUIDANCE_SCALE, PYTHON, ROOT, STORAGE, UNET_CKPT, UNET_CONFIG
-from .progress import parse_job_line
+from .config import (
+    GUIDANCE_SCALE,
+    PYTHON,
+    ROOT,
+    STORAGE,
+    UNET_CKPT,
+    UNET_CONFIG,
+    WORKER_LOCK_PATH,
+    WORKER_PID_PATH,
+    ensure_dirs,
+    load_gpus,
+)
+from .gpu_runtime import (
+    cuda_visible_from_pid,
+    inference_pids,
+    job_id_from_pid,
+    write_status,
+)
+from .media import ensure_preview as write_preview_mp4, ffmpeg_preview_video
 
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
 _char_thread: Optional[threading.Thread] = None
+_gpu_lock = threading.Lock()
+_busy_gpus: dict[int, str] = {}
+_gpu_threads: dict[int, threading.Thread] = {}
+_lock_fd: Optional[int] = None
 
 
 def start_worker() -> None:
+    """In-process loop (tests only). Production uses `python -m webapp.worker`."""
     global _thread
     if _thread and _thread.is_alive():
         return
     _stop.clear()
     _recover_stale()
-    _thread = threading.Thread(target=_loop, name="latentsync-worker", daemon=True)
+    _thread = threading.Thread(target=_loop, name="qemix-worker", daemon=True)
     _thread.start()
 
 
 def _recover_stale() -> None:
+    adopted = _adopt_running_inference()
     with db.db() as conn:
         conn.execute(
             "UPDATE characters SET status = ?, error = NULL WHERE status IN (?, ?)",
-            ("queued", "preparing", "aligning"),  # aligning: 兼容旧状态
+            ("queued", "preparing", "aligning"),
         )
-        if inference_running():
+        rows = conn.execute("SELECT id FROM jobs WHERE status = ?", ("running",)).fetchall()
+        for row in rows:
+            if row["id"] in adopted:
+                continue
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = ?, error = ?, finished_at = ?, stage = ?, remaining_seconds = 0
+                WHERE id = ?
+                """,
+                ("failed", "合成进程已退出", db.utcnow(), "failed", row["id"]),
+            )
+
+
+def _adopt_running_inference() -> set[str]:
+    adopted: set[str] = set()
+    for pid in inference_pids():
+        job_id = job_id_from_pid(pid)
+        gpu_id = cuda_visible_from_pid(pid)
+        if job_id:
+            adopted.add(job_id)
+        if gpu_id is None:
+            continue
+        with _gpu_lock:
+            if gpu_id in _busy_gpus:
+                continue
+            _busy_gpus[gpu_id] = job_id or f"pid:{pid}"
+        th = threading.Thread(
+            target=_watch_adopted,
+            args=(pid, gpu_id, job_id),
+            name=f"adopt-gpu{gpu_id}",
+            daemon=True,
+        )
+        with _gpu_lock:
+            _gpu_threads[gpu_id] = th
+        th.start()
+    return adopted
+
+
+def _watch_adopted(pid: int, gpu_id: int, job_id: Optional[str]) -> None:
+    try:
+        while True:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+            time.sleep(1)
+        if not job_id:
             return
-        conn.execute(
-            """
-            UPDATE jobs
-            SET status = ?, error = ?, finished_at = ?, stage = ?, remaining_seconds = 0
-            WHERE status = ?
-            """,
-            ("failed", "服务重启，合成中断", db.utcnow(), "failed", "running"),
-        )
+        output_path = STORAGE / "jobs" / job_id / "output.mp4"
+        if output_path.exists() and output_path.stat().st_size >= 1000:
+            _mark_job_done(job_id, output_path, only_if_running=True)
+        else:
+            with db.db() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, error = ?, finished_at = ?, stage = ?, remaining_seconds = 0
+                    WHERE id = ? AND status = ?
+                    """,
+                    ("failed", "合成进程已退出", db.utcnow(), "failed", job_id, "running"),
+                )
+    finally:
+        _release_gpu(gpu_id)
+
+
+def _mark_job_done(job_id: str, output_path: Path, *, only_if_running: bool = False) -> None:
+    preview_path = output_path.parent / "preview.mp4"
+    preview_stored = None
+    try:
+        write_preview_mp4(output_path, preview_path)
+        preview_stored = str(preview_path)
+    except Exception as exc:
+        print(f"Job {job_id} preview failed: {exc}")
+    sql = """
+        UPDATE jobs
+        SET status = ?, progress = ?, output_path = ?, preview_path = ?, finished_at = ?, error = NULL,
+            progress_percent = 100, remaining_seconds = 0, stage = ?, tqdm_remaining = 0,
+            progress_updated_at = ?
+        WHERE id = ?
+    """
+    args = (
+        "done",
+        "已完成",
+        str(output_path),
+        preview_stored,
+        db.utcnow(),
+        "done",
+        db.utcnow(),
+        job_id,
+    )
+    if only_if_running:
+        sql += " AND status = ?"
+        args = args + ("running",)
+    with db.db() as conn:
+        conn.execute(sql, args)
 
 
 def stop_worker() -> None:
@@ -49,22 +161,73 @@ def stop_worker() -> None:
 
 
 def inference_running() -> bool:
-    try:
-        result = subprocess.run(
-            ["pgrep", "-af", "scripts.inference"],
-            capture_output=True,
-            text=True,
-        )
-        for line in result.stdout.splitlines():
-            if "pgrep" in line:
-                continue
-            if "/bin/bash" in line or "extglob" in line:
-                continue
-            if "scripts.inference" in line and "python" in line.lower():
-                return True
-        return False
-    except Exception:
-        return False
+    _reap_gpus()
+    with _gpu_lock:
+        if _busy_gpus:
+            return True
+    return bool(inference_pids())
+
+
+def gpu_snapshot() -> list[dict]:
+    _reap_gpus()
+    with _gpu_lock:
+        busy = dict(_busy_gpus)
+    for pid in inference_pids():
+        gid = cuda_visible_from_pid(pid)
+        if gid is None:
+            continue
+        if gid not in busy:
+            busy[gid] = job_id_from_pid(pid) or ""
+    rows = []
+    for gid in load_gpus():
+        raw = busy.get(gid)
+        job_id = raw if raw else None
+        rows.append({"id": gid, "busy": gid in busy, "job_id": job_id})
+    return rows
+
+
+def _publish_status() -> None:
+    write_status(
+        {
+            "pid": os.getpid(),
+            "updated_at": db.utcnow(),
+            "gpus": gpu_snapshot(),
+        }
+    )
+
+
+def _reap_gpus() -> None:
+    with _gpu_lock:
+        dead = [gid for gid, th in _gpu_threads.items() if th is not None and not th.is_alive()]
+        for gid in dead:
+            _gpu_threads.pop(gid, None)
+            _busy_gpus.pop(gid, None)
+
+
+def _acquire_gpu() -> Optional[int]:
+    _reap_gpus()
+    occupied = set()
+    for pid in inference_pids():
+        gid = cuda_visible_from_pid(pid)
+        if gid is not None:
+            occupied.add(gid)
+    with _gpu_lock:
+        for gid in load_gpus():
+            if gid not in _busy_gpus and gid not in occupied:
+                _busy_gpus[gid] = ""
+                return gid
+    return None
+
+
+def _bind_gpu(gpu_id: int, job_id: str) -> None:
+    with _gpu_lock:
+        _busy_gpus[gpu_id] = job_id
+
+
+def _release_gpu(gpu_id: int) -> None:
+    with _gpu_lock:
+        _busy_gpus.pop(gpu_id, None)
+        _gpu_threads.pop(gpu_id, None)
 
 
 TARGET_FPS = 25
@@ -243,38 +406,7 @@ def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
 
 
 def _ffmpeg_preview_video(src: Path, dst: Path) -> None:
-    """网页预览用低码率片：最高 720p、CRF28、faststart，合成仍用 video.mp4。"""
-    tmp = dst.with_suffix(".tmp.mp4")
-    try:
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(src),
-                "-vf",
-                r"scale=-2:min(720\,ih)",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "28",
-                "-pix_fmt",
-                "yuv420p",
-                "-movflags",
-                "+faststart",
-                "-an",
-                str(tmp),
-            ],
-            check=True,
-        )
-        tmp.replace(dst)
-    finally:
-        tmp.unlink(missing_ok=True)
+    ffmpeg_preview_video(src, dst)
 
 
 def _probe(path: Path) -> dict:
@@ -314,8 +446,13 @@ def _loop() -> None:
     while not _stop.is_set():
         try:
             _kick_character_prepare()
-            _run_next_job()
+            _try_start_jobs()
+            _publish_status()
         except Exception:
+            try:
+                _publish_status()
+            except Exception:
+                pass
             time.sleep(2)
         time.sleep(1)
 
@@ -370,9 +507,37 @@ def _pick_character_needing_preview() -> Optional[str]:
     return None
 
 
-def _run_next_job() -> None:
-    if inference_running():
-        return
+def _try_start_jobs() -> None:
+    while True:
+        gpu_id = _acquire_gpu()
+        if gpu_id is None:
+            return
+        try:
+            job = _claim_next_job()
+            if job is None:
+                _release_gpu(gpu_id)
+                return
+            _bind_gpu(gpu_id, job["id"])
+            with db.db() as conn:
+                conn.execute(
+                    "UPDATE jobs SET progress = ? WHERE id = ?",
+                    (f"加载模型 (GPU {gpu_id})", job["id"]),
+                )
+            th = threading.Thread(
+                target=_execute_job,
+                args=(job, gpu_id),
+                name=f"infer-gpu{gpu_id}",
+                daemon=True,
+            )
+            with _gpu_lock:
+                _gpu_threads[gpu_id] = th
+            th.start()
+        except Exception:
+            _release_gpu(gpu_id)
+            raise
+
+
+def _claim_next_job() -> Optional[dict]:
     with db.db() as conn:
         rows = conn.execute(
             """
@@ -404,7 +569,7 @@ def _run_next_job() -> None:
             job = item
             break
         if job is None:
-            return
+            return None
         conn.execute(
             """
             UPDATE jobs
@@ -414,11 +579,10 @@ def _run_next_job() -> None:
             """,
             ("running", "加载模型", "loading", db.utcnow(), db.utcnow(), job["id"]),
         )
+    return job
 
-    _execute_job(job)
 
-
-def _execute_job(job: dict) -> None:
+def _execute_job(job: dict, gpu_id: int) -> None:
     job_id = job["id"]
     job_dir = STORAGE / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -452,48 +616,27 @@ def _execute_job(job: dict) -> None:
     ]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    log_path = job_dir / "inference.log"
+    start_off = log_path.stat().st_size if log_path.exists() else 0
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(ROOT),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
-        assert proc.stdout is not None
-        buf = ""
-        while True:
-            chunk = proc.stdout.read(256)
-            if not chunk:
-                break
-            buf += chunk.decode("utf-8", errors="replace")
-            while True:
-                idx_r, idx_n = buf.find("\r"), buf.find("\n")
-                cuts = [i for i in (idx_r, idx_n) if i >= 0]
-                if not cuts:
-                    if len(buf) > 800:
-                        buf = buf[-200:]
-                    break
-                i = min(cuts)
-                line, buf = buf[:i], buf[i + 1 :]
-                fields = parse_job_line(line, steps=int(job.get("steps") or 20))
-                if fields:
-                    _update_job_progress(job_id, fields)
-        code = proc.wait()
+        log_f = open(log_path, "ab", buffering=0)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+        finally:
+            log_f.close()
+        code = _drain_inference_log(proc, log_path, start_off, job)
         if code != 0 or not output_path.exists() or output_path.stat().st_size < 1000:
             raise RuntimeError(f"合成失败，退出码 {code}")
-        with db.db() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = ?, progress = ?, output_path = ?, finished_at = ?, error = NULL,
-                    progress_percent = 100, remaining_seconds = 0, stage = ?, tqdm_remaining = 0,
-                    progress_updated_at = ?
-                WHERE id = ?
-                """,
-                ("done", "已完成", str(output_path), db.utcnow(), "done", db.utcnow(), job_id),
-            )
+        _mark_job_done(job_id, output_path)
     except Exception as exc:
         with db.db() as conn:
             conn.execute(
@@ -506,6 +649,7 @@ def _execute_job(job: dict) -> None:
             )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        _release_gpu(gpu_id)
 
 
 def _update_job_progress(job_id: str, fields: dict) -> None:
@@ -532,3 +676,77 @@ def _update_job_progress(job_id: str, fields: dict) -> None:
     sql = f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?"
     with db.db() as conn:
         conn.execute(sql, values)
+
+
+def _drain_inference_log(proc: subprocess.Popen, log_path: Path, start_off: int, job: dict) -> int:
+    buf = ""
+    with open(log_path, "rb") as rf:
+        rf.seek(start_off)
+        while True:
+            chunk = rf.read(4096)
+            if chunk:
+                buf += chunk.decode("utf-8", errors="replace")
+                buf = _consume_progress_buf(buf, job)
+                continue
+            code = proc.poll()
+            if code is not None:
+                extra = rf.read(4096)
+                while extra:
+                    buf += extra.decode("utf-8", errors="replace")
+                    buf = _consume_progress_buf(buf, job)
+                    extra = rf.read(4096)
+                return code
+            time.sleep(0.1)
+
+
+def _consume_progress_buf(buf: str, job: dict) -> str:
+    while True:
+        idx_r, idx_n = buf.find("\r"), buf.find("\n")
+        cuts = [i for i in (idx_r, idx_n) if i >= 0]
+        if not cuts:
+            return buf[-200:] if len(buf) > 800 else buf
+        i = min(cuts)
+        line, buf = buf[:i], buf[i + 1 :]
+        fields = parse_job_line(line, steps=int(job.get("steps") or 30))
+        if fields:
+            _update_job_progress(job["id"], fields)
+
+
+def main() -> None:
+    """Standalone worker process. Never kills live inference."""
+    global _lock_fd
+    ensure_dirs()
+    db.init_db()
+    fd = os.open(str(WORKER_LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        print("合成 worker 已在运行，本次退出", file=sys.stderr)
+        sys.exit(0)
+    _lock_fd = fd
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+    os.fsync(fd)
+    WORKER_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+
+    def _on_term(_signum, _frame) -> None:
+        _stop.set()
+
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT, _on_term)
+    _recover_stale()
+    _publish_status()
+    print(f"合成 worker 已启动 pid={os.getpid()} gpus={load_gpus()}", flush=True)
+    try:
+        _loop()
+    finally:
+        try:
+            _publish_status()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

@@ -7,22 +7,24 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>QeMix数字人平台</title>
-  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="icon" href="/favicon.png" type="image/png" sizes="512x512">
-  <link rel="apple-touch-icon" href="/favicon.png">
+  <!--APP_BASE-->
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon.png" type="image/png" sizes="512x512">
+  <link rel="apple-touch-icon" href="favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/admin/assets/vendor/animate.min.css">
-  <link rel="stylesheet" href="/admin/assets/style.css">
+  <link rel="stylesheet" href="admin/assets/vendor/animate.min.css">
+  <link rel="stylesheet" href="admin/assets/style.css">
   <script>
     (async function () {
       var TAB = 'dh_admin_gate_tab';
+      var u = window.apiUrl || function (p) { return p; };
       try {
         if (sessionStorage.getItem(TAB) === '1') return;
       } catch (_) {}
       try {
-        var res = await fetch('/api/admin/session', { credentials: 'same-origin' });
+        var res = await fetch(u('/api/admin/session'), { credentials: 'same-origin' });
         var body = await res.json();
         var d = (body && body.data) || {};
         if (!d.enabled) {
@@ -32,9 +34,9 @@
       } catch (_) {}
       document.documentElement.style.visibility = 'hidden';
       try {
-        await fetch('/api/admin/logout', { method: 'POST', credentials: 'same-origin' });
+        await fetch(u('/api/admin/logout'), { method: 'POST', credentials: 'same-origin' });
       } catch (_) {}
-      location.replace('/login.html');
+      location.replace(u('/login.html'));
     })();
   </script>
 </head>
@@ -152,7 +154,7 @@
               </div>
               <div class="avatar-private-filter hidden" id="avatarPrivateFilterWrap">
                 <input type="search" class="search-input" id="avatarPrivateSearch" placeholder="输入用户名筛选…">
-                <p class="hint-text" id="avatarPrivateHint">留空显示全部个人形象；输入用户名可筛选</p>
+                <p class="hint-text" id="avatarPrivateHint">必须输入用户ID才能查看该用户的个人形象，不会列出其他人的个人库</p>
               </div>
               <div class="media-grid avatar-page-grid" id="avatarGrid"></div>
             </div>
@@ -198,7 +200,7 @@
               </div>
               <div class="avatar-private-filter hidden" id="createPrivateFilterWrap">
                 <input type="search" class="search-input" id="createPrivateSearch" placeholder="输入用户名筛选…">
-                <p class="hint-text" id="createPrivateHint">留空显示全部个人形象；输入用户名可筛选</p>
+                <p class="hint-text" id="createPrivateHint">必须输入用户ID才能查看该用户的个人形象，不会列出其他人的个人库</p>
               </div>
               <div class="media-grid avatar-page-grid" id="createAvatarGrid"></div>
             </div>
@@ -223,7 +225,7 @@
                 <div class="field">
                   <label>合成质量</label>
                   <div class="quality-steps" role="radiogroup" aria-label="合成质量">
-                    <label class="step"><input type="radio" name="steps" value="20" checked><span class="step-name">标准</span></label>
+                    <label class="step"><input type="radio" name="steps" value="30" checked><span class="step-name">标准</span></label>
                     <label class="step"><input type="radio" name="steps" value="50"><span class="step-name">高质量</span></label>
                     <label class="step"><input type="radio" name="steps" value="80"><span class="step-name">超高质量</span></label>
                   </div>
@@ -249,6 +251,11 @@
             <h3>服务健康</h3>
             <div class="health-chips" id="healthChips"></div>
           </div>
+          <div class="panel" style="margin-bottom:20px">
+            <h3>合成 GPU</h3>
+            <p style="color:var(--muted);font-size:13px;margin-bottom:12px">在根目录 <code>config.yaml</code> 里配置，编号与 nvidia-smi 一致。每张卡同时只跑一条合成。</p>
+            <div class="health-chips" id="gpuChips"></div>
+          </div>
           <div class="panel">
             <h3>访问会话</h3>
             <p style="color:var(--muted);font-size:14px;margin-bottom:16px">退出、关闭本页，或连续 30 分钟没有任何操作，都会自动登出，需重新输入访问密钥</p>
@@ -268,7 +275,7 @@
   </div>
 
   <div class="toasts" id="toasts"></div>
-  <script src="/admin/assets/fx.js"></script>
-  <script src="/admin/assets/app.js"></script>
+  <script src="admin/assets/fx.js"></script>
+  <script src="admin/assets/app.js"></script>
 </body>
 </html>
