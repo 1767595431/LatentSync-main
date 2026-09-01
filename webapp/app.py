@@ -3,6 +3,7 @@ import json
 import math
 import secrets
 import shutil
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -11,10 +12,12 @@ from typing import Optional
 from contextlib import asynccontextmanager
 
 from fastapi import Cookie, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
 
 from . import avatars, db, tasks
 from .config import (
@@ -85,6 +88,14 @@ app = FastAPI(
     generate_unique_id_function=lambda route: route.summary or route.name,
 )
 app.add_middleware(PublicPrefixMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Accept-Ranges", "Content-Range", "Content-Length", "Content-Disposition"],
+)
 ADMIN_DIR = WEBAPP_DIR / "admin"
 _BASE_JS = (ADMIN_DIR / "assets" / "base.js").read_text(encoding="utf-8")
 _SESSIONS: dict[str, float] = {}
@@ -118,11 +129,29 @@ def _set_session_cookie(response: Response, token: str, path: str = "/") -> None
 
 
 def ok(data=None, msg: str = "ok"):
-    return {"code": 0, "msg": msg, "success": True, "data": data}
+    return {"code": 0, "msg": msg, "message": msg, "success": True, "data": data}
 
 
 def fail(msg: str, code: int = 1):
-    return JSONResponse({"code": code, "msg": msg, "success": False, "data": None})
+    return JSONResponse({"code": code, "msg": msg, "message": msg, "success": False, "data": None})
+
+
+def _api_path(request: Request) -> str:
+    path = request.url.path or ""
+    _, inner = split_public_path(path)
+    return inner or path
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_to_envelope(request: Request, exc: RequestValidationError):
+    if not _api_path(request).startswith("/api/"):
+        return JSONResponse({"detail": exc.errors()}, status_code=422)
+    parts = []
+    for err in exc.errors():
+        loc = [str(x) for x in err.get("loc", ()) if x not in {"body", "query", "path", "header"}]
+        text = err.get("msg") or "参数错误"
+        parts.append(f"{'.'.join(loc)}：{text}" if loc else text)
+    return fail("；".join(parts) if parts else "参数错误")
 
 
 def _is_admin(request: Optional[Request]) -> bool:
@@ -1018,7 +1047,7 @@ def delete_job(
     return {"ok": True}
 
 
-@app.get("/api/health")
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 def health(request: Request):
     from .gpu_runtime import gpu_snapshot, inference_running, worker_alive
 
@@ -1043,11 +1072,13 @@ def health(request: Request):
     )
 
 
-@app.get("/api/system/ready")
+@app.api_route("/api/system/ready", methods=["GET", "HEAD"])
 def system_ready():
     from .gpu_runtime import gpu_snapshot, inference_running, worker_alive
 
     ffmpeg_ok = shutil.which("ffmpeg") is not None
+    if not ffmpeg_ok:
+        ffmpeg_ok = (Path(sys.executable).resolve().parent / "ffmpeg").is_file()
     model_ok = UNET_CKPT.exists()
     return ok(
         {

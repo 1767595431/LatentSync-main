@@ -10,6 +10,11 @@ import time
 from pathlib import Path
 from typing import Optional
 
+_env_bin = str(Path(sys.executable).resolve().parent)
+_path = os.environ.get("PATH", "")
+if _env_bin not in _path.split(os.pathsep):
+    os.environ["PATH"] = _env_bin + (os.pathsep + _path if _path else "")
+
 from . import db
 from .config import (
     GUIDANCE_SCALE,

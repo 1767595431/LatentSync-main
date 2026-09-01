@@ -2,13 +2,34 @@
 
 本文仅面向业务对接。下文列出的接口就是对接范围；未出现的路径请勿调用、勿依赖。
 
-Base URL 由平台提供，下文示例为：
+公网 Base URL（对接请用这个）：
 
 ```text
-http://<主机>:8811
+http://36.136.54.165:8888/QeMixAvatar
 ```
 
-所有路径均为相对 Base URL。若前面还有反向代理前缀，把前缀加在 Base URL 上即可，接口路径不变。
+连通性自检：
+
+```bash
+curl -s http://36.136.54.165:8888/QeMixAvatar/api/system/ready
+```
+
+所有路径均为相对 Base URL，例如列出公共形象：
+
+```text
+http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public
+```
+
+**不要用下面这些地址，会连不上或 404：**
+
+| 错误写法 | 结果 |
+|---|---|
+| `http://36.136.54.165:8811/...` | 公网未开放 8811，**Connection refused** |
+| `http://36.136.54.165:8888/api/...`（缺少 `/QeMixAvatar`） | 代理 **404** |
+| `https://36.136.54.165:8888/...` | 该端口不是 HTTPS |
+| `http://<内网IP>:8811/...` | 仅机房内网可达，第三方公网访问不到 |
+
+网页控制台与 API 共用同一 Base URL：[http://36.136.54.165:8888/QeMixAvatar](http://36.136.54.165:8888/QeMixAvatar)
 
 ---
 
@@ -24,6 +45,7 @@ http://<主机>:8811
 {
   "code": 0,
   "msg": "ok",
+  "message": "ok",
   "success": true,
   "data": {}
 }
@@ -35,6 +57,7 @@ http://<主机>:8811
 {
   "code": 1,
   "msg": "错误说明",
+  "message": "错误说明",
   "success": false,
   "data": null
 }
@@ -43,7 +66,7 @@ http://<主机>:8811
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `code` | int | `0` 成功，非 `0` 失败 |
-| `msg` | string | 提示信息 |
+| `msg` / `message` | string | 提示信息，两字段同义 |
 | `success` | bool | 是否成功 |
 | `data` | object / array / null | 成功为业务数据，失败为 `null` |
 
@@ -158,6 +181,7 @@ X-User-Id: u1001
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/api/system/ready` | 检查服务是否可调用（连通性） |
 | GET | `/api/avatars` | 分页列出形象 |
 | POST | `/api/avatars/upload` | 分片上传形象（init / chunk / complete / abort；多文件并行即批量） |
 | POST | `/api/avatars/{identifier}/rebake` | 转码失败后重新转码 |
@@ -171,6 +195,20 @@ X-User-Id: u1001
 | GET | `/api/tasks/{task_id}/preview` | 成片预览（mp4，低码率，带声音） |
 | GET | `/api/tasks/{task_id}/download` | 成片原片下载 |
 | DELETE | `/api/tasks/{task_id}` | 删除作品 |
+
+---
+
+### 3.1 检查服务是否就绪
+
+`GET /api/system/ready`（也可用 `HEAD`）
+
+无需鉴权。用于确认公网代理和本服务都活着。`data.ready` 为 `true` 表示 ffmpeg 和模型文件齐全，可以提交合成。
+
+```bash
+curl -s http://36.136.54.165:8888/QeMixAvatar/api/system/ready
+```
+
+成功时 `data` 含 `ready`、`checks.ffmpeg` / `checks.model` / `checks.gpu`、`gpu_busy`、`worker_alive`。浏览器跨域已允许；带 `X-User-Id` 的预检 `OPTIONS` 也会放行。
 
 ---
 
@@ -249,13 +287,13 @@ X-User-Id: u1001
 
 ```bash
 # 公共形象
-curl -s "http://127.0.0.1:8811/api/avatars?type=public&page=1&page_size=12"
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public&page=1&page_size=12"
 
 # 某用户的个人形象
-curl -s "http://127.0.0.1:8811/api/avatars?type=private&username=u1001"
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=private&username=u1001"
 
 # 公共 + 该用户个人
-curl -s "http://127.0.0.1:8811/api/avatars?type=all&username=u1001"
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=all&username=u1001"
 ```
 
 ---
@@ -311,7 +349,7 @@ curl -s "http://127.0.0.1:8811/api/avatars?type=all&username=u1001"
 | `分片大小无效` | `chunk_size` 越界 |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=init \
   -F name=新闻主播 \
   -F type=private \
@@ -353,7 +391,7 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 | `最后分片大小应为 N 字节` | 最后一片大小不对 |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=chunk \
   -F upload_id=<上传ID> \
   -F chunk_index=0 \
@@ -382,7 +420,7 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 | `未知的上传阶段` | `stage` 不是 `init` / `chunk` / `complete` / `abort` |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=complete \
   -F upload_id=<上传ID>
 ```
@@ -416,7 +454,7 @@ POST /api/avatars/upload?stage=abort&upload_id=<上传ID>
 | `上传任务不存在` | ID 格式无效 |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=abort \
   -F upload_id=<上传ID>
 ```
@@ -427,12 +465,12 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 
 ```bash
 # 视频 A
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=init -F name=主播A -F type=private -F username=u1001 \
   -F filename=a.mp4 -F filesize=$(stat -c%s a.mp4) -F chunk_size=8388608
 
 # 视频 B（可同时发）
-curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/avatars/upload \
   -F stage=init -F name=主播B -F type=private -F username=u1001 \
   -F filename=b.mp4 -F filesize=$(stat -c%s b.mp4) -F chunk_size=8388608
 ```
@@ -461,7 +499,7 @@ curl -s -X POST http://127.0.0.1:8811/api/avatars/upload \
 失败常见 `msg`：`形象不存在`。
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8811/api/avatars/<形象ID>/rebake?username=u1001"
+curl -s -X POST "http://36.136.54.165:8888/QeMixAvatar/api/avatars/<形象ID>/rebake?username=u1001"
 ```
 
 ---
@@ -480,7 +518,7 @@ curl -s -X POST "http://127.0.0.1:8811/api/avatars/<形象ID>/rebake?username=u1
 | `该形象还有排队或正在合成的任务` | 仍有未完成作品 |
 
 ```bash
-curl -s -X DELETE "http://127.0.0.1:8811/api/avatars/<形象ID>?username=u1001"
+curl -s -X DELETE "http://36.136.54.165:8888/QeMixAvatar/api/avatars/<形象ID>?username=u1001"
 ```
 
 ---
@@ -502,13 +540,13 @@ curl -s -X DELETE "http://127.0.0.1:8811/api/avatars/<形象ID>?username=u1001"
 
 ```bash
 # 公共
-curl -o poster.jpg http://127.0.0.1:8811/api/characters/<形象ID>/poster
+curl -o poster.jpg http://36.136.54.165:8888/QeMixAvatar/api/characters/<形象ID>/poster
 
 # 个人（必须带头；下面两种都拿不到文件）
 curl -H "X-User-Id: u1001" -o poster.jpg \
-  http://127.0.0.1:8811/api/characters/<形象ID>/poster
-curl -o poster.jpg http://127.0.0.1:8811/api/characters/<形象ID>/poster
-curl -o poster.jpg "http://127.0.0.1:8811/api/characters/<形象ID>/poster?user_id=u1001"
+  http://36.136.54.165:8888/QeMixAvatar/api/characters/<形象ID>/poster
+curl -o poster.jpg http://36.136.54.165:8888/QeMixAvatar/api/characters/<形象ID>/poster
+curl -o poster.jpg "http://36.136.54.165:8888/QeMixAvatar/api/characters/<形象ID>/poster?user_id=u1001"
 ```
 
 ### 5.2 形象预览视频
@@ -521,7 +559,7 @@ curl -o poster.jpg "http://127.0.0.1:8811/api/characters/<形象ID>/poster?user_
 
 ```bash
 curl -H "X-User-Id: u1001" -o avatar.mp4 \
-  http://127.0.0.1:8811/api/characters/<形象ID>/video
+  http://36.136.54.165:8888/QeMixAvatar/api/characters/<形象ID>/video
 ```
 
 ---
@@ -585,7 +623,7 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 `tasks` 元素为完整作品对象。
 
 ```bash
-curl -s "http://127.0.0.1:8811/api/tasks?username=u1001&status=wait&page=1"
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/tasks?username=u1001&status=wait&page=1"
 ```
 
 ---
@@ -620,7 +658,7 @@ curl -s "http://127.0.0.1:8811/api/tasks?username=u1001&status=wait&page=1"
 | `音频不能超过 300MB` | 超限 |
 
 ```bash
-curl -s -X POST http://127.0.0.1:8811/api/tasks/create \
+curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/tasks/create \
   -F avatar_identifier=<形象ID> \
   -F username=u1001 \
   -F task_name=今日新闻 \
@@ -643,7 +681,7 @@ curl -s -X POST http://127.0.0.1:8811/api/tasks/create \
 失败 `msg`：`任务不存在`。
 
 ```bash
-curl -s "http://127.0.0.1:8811/api/tasks/<作品ID>?username=u1001"
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>?username=u1001"
 ```
 
 建议间隔 2～5 秒轮询，`status` 为 `done` 或 `error` 后停止。
@@ -663,7 +701,7 @@ curl -s "http://127.0.0.1:8811/api/tasks/<作品ID>?username=u1001"
 | `音频文件已丢失，无法重试` | 音频不在 |
 
 ```bash
-curl -s -X POST "http://127.0.0.1:8811/api/tasks/<作品ID>/retry?username=u1001"
+curl -s -X POST "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/retry?username=u1001"
 ```
 
 ---
@@ -685,11 +723,11 @@ curl -s -X POST "http://127.0.0.1:8811/api/tasks/<作品ID>/retry?username=u1001
 ```bash
 # 个人成片
 curl -H "X-User-Id: u1001" -o preview.mp4 \
-  http://127.0.0.1:8811/api/tasks/<作品ID>/preview
+  http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/preview
 
 # 以下都拿不到个人成片
-curl -o preview.mp4 http://127.0.0.1:8811/api/tasks/<作品ID>/preview
-curl -o preview.mp4 "http://127.0.0.1:8811/api/tasks/<作品ID>/preview?user_id=u1001"
+curl -o preview.mp4 http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/preview
+curl -o preview.mp4 "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/preview?user_id=u1001"
 ```
 
 ---
@@ -706,7 +744,7 @@ Content-Disposition: attachment; filename="{task_id}.mp4"
 
 ```bash
 curl -H "X-User-Id: u1001" -OJ \
-  http://127.0.0.1:8811/api/tasks/<作品ID>/download
+  http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/download
 ```
 
 ---
@@ -725,7 +763,7 @@ curl -H "X-User-Id: u1001" -OJ \
 | `正在合成的任务不能删除` | `status=run` |
 
 ```bash
-curl -s -X DELETE "http://127.0.0.1:8811/api/tasks/<作品ID>?username=u1001"
+curl -s -X DELETE "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>?username=u1001"
 ```
 
 ---
@@ -733,8 +771,9 @@ curl -s -X DELETE "http://127.0.0.1:8811/api/tasks/<作品ID>?username=u1001"
 ## 7. 对接注意
 
 1. **只使用本文列出的路径。** 其它路径不在对接范围内。
-2. 用户 ID 由你们系统生成并保管；本接口按该 ID 隔离个人库，不会替你们做登录态。
-3. 个人媒体必须由你们的服务端加 `X-User-Id` 拉取，不要把可打开的文件地址交给最终用户去分享。
-4. `identifier` 与 `id`、`username` 与 `user_id`、`thumbnail` 与 `preview_thumbnail`、`video_path` 与 `preview_video_path`、`result_path` 与 `result_path_lbr` 为同一数据的别名，任意取一个即可。
-5. 相对路径需拼在 Base URL 后；若部署带了路径前缀，前缀加在主机之后、`/api` 之前。
-6. 批量上传请按文件并行调用 4.2，不要自行拼接多文件 multipart。中途放弃必须 `abort`；未完成的分片超过 24 小时无活动会被服务端删除。
+2. 公网 Base URL 必须是 `http://36.136.54.165:8888/QeMixAvatar`。写成 `:8811` 会 Connection refused；漏掉 `/QeMixAvatar` 会 404。
+3. 用户 ID 由你们系统生成并保管；本接口按该 ID 隔离个人库，不会替你们做登录态。
+4. 个人媒体必须由你们的服务端加 `X-User-Id` 拉取，不要把可打开的文件地址交给最终用户去分享。
+5. `identifier` 与 `id`、`username` 与 `user_id`、`thumbnail` 与 `preview_thumbnail`、`video_path` 与 `preview_video_path`、`result_path` 与 `result_path_lbr` 为同一数据的别名，任意取一个即可。
+6. 相对路径拼在 Base URL 后，不要再自己加一层前缀。
+7. 批量上传请按文件并行调用 4.2，不要自行拼接多文件 multipart。中途放弃必须 `abort`；未完成的分片超过 24 小时无活动会被服务端删除。
