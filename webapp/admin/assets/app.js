@@ -9,10 +9,11 @@ const PAGES = {
 };
 
 const STATUS = {
-  wait: { label: '等待', cls: 'badge-wait', tag: 'tag-wait' },
+  wait: { label: '排队中', cls: 'badge-wait', tag: 'tag-wait' },
   run: { label: '合成中', cls: 'badge-run', tag: 'tag-run' },
   done: { label: '已完成', cls: 'badge-done', tag: 'tag-done' },
-  error: { label: '失败', cls: 'badge-error', tag: 'tag-error' },
+  cancelled: { label: '已取消', cls: 'badge-cancel', tag: 'tag-cancel' },
+  error: { label: '合成失败', cls: 'badge-error', tag: 'tag-error' },
 };
 
 const BAKE = {
@@ -62,7 +63,7 @@ const HOME_FILTERS = {
   'avatar-all': { label: '全部形象' },
   done: { label: '已完成作品' },
   run: { label: '进行中作品' },
-  wait: { label: '等待中作品' },
+  wait: { label: '排队中作品' },
   baking: { label: '转码处理中' },
 };
 
@@ -406,7 +407,7 @@ function renderStatsRow({ animate = true } = {}) {
     ['avatar-all', '全部形象', totalAv, 'avatar-stat'],
     ['done', '完成', tk.done, 'task-stat'],
     ['run', '进行中', tk.run, 'task-stat'],
-    ['wait', '等待', tk.wait, 'task-stat'],
+    ['wait', '排队中', tk.wait, 'task-stat'],
     ['baking', '转码处理', baking, 'bake-stat'],
   ];
   const row = $('#statRow');
@@ -504,6 +505,28 @@ function patchMediaCard(card, t, isDoneFocus) {
   if (poster && card.dataset.play && !poster.querySelector('.play-fab')) {
     poster.insertAdjacentHTML('beforeend', playOverlay());
   }
+  const actionsHtml = mediaCardActionsHtml(t);
+  let actionsEl = card.querySelector('.card-actions');
+  if (actionsHtml) {
+    if (!actionsEl) {
+      card.querySelector('.card-body')?.insertAdjacentHTML('beforeend', `<div class="card-actions" data-patch-key="${esc(t.status)}">${actionsHtml}</div>`);
+    } else if (actionsEl.dataset.patchKey !== t.status) {
+      actionsEl.dataset.patchKey = t.status;
+      actionsEl.innerHTML = actionsHtml;
+    }
+  } else {
+    actionsEl?.remove();
+  }
+}
+
+function mediaCardActionsHtml(t) {
+  if (t.status === 'wait' || t.status === 'run') {
+    return `<button class="btn btn-ghost btn-sm" data-cancel="${esc(t.task_id)}">取消</button>`;
+  }
+  if (t.status === 'error' || t.status === 'cancelled') {
+    return `<button class="btn btn-ghost btn-sm" data-retry="${esc(t.task_id)}">重试</button>`;
+  }
+  return '';
 }
 
 function workCardActionsHtml(t) {
@@ -520,8 +543,11 @@ function workCardActionsHtml(t) {
     actions += `<button class="btn btn-primary btn-sm" data-play="${esc(rv)}"${fb} data-title="${esc(t.task_name)}">播放成品</button>`;
   }
   if (isDone && t.result_path) actions += `<a class="btn btn-ghost btn-sm" href="${API}/api/tasks/${esc(t.task_id)}/download" target="_blank">下载</a>`;
-  if (t.status === 'error') actions += `<button class="btn btn-ghost btn-sm" data-retry="${esc(t.task_id)}">重试</button>`;
-  actions += `<button class="btn btn-ghost btn-sm" data-del="${esc(t.task_id)}">删除</button>`;
+  if (t.status === 'wait' || t.status === 'run') {
+    actions += `<button class="btn btn-ghost btn-sm" data-cancel="${esc(t.task_id)}">取消</button>`;
+  }
+  if (t.status === 'error' || t.status === 'cancelled') actions += `<button class="btn btn-ghost btn-sm" data-retry="${esc(t.task_id)}">重试</button>`;
+  if (t.status !== 'run') actions += `<button class="btn btn-ghost btn-sm" data-del="${esc(t.task_id)}">删除</button>`;
   return actions;
 }
 
@@ -574,18 +600,28 @@ function patchWorkCard(card, t) {
       if (bar) bar.style.width = `${pct}%`;
       if (msgEl) msgEl.textContent = `${pct}% · ${msg || '处理中…'}`;
     }
-  } else if (t.status === 'error' && msg) {
+  } else if (t.status === 'cancelled') {
     if (!prog) {
       const body = card.querySelector('.work-body');
       const actions = body?.querySelector('.card-actions');
-      const html = `<div class="work-progress"><div class="msg" style="color:var(--danger)">${esc(msg)}</div></div>`;
+      const html = `<div class="work-progress"><div class="msg">${esc('已取消')}</div></div>`;
       if (actions) actions.insertAdjacentHTML('beforebegin', html);
       else body?.insertAdjacentHTML('beforeend', html);
     } else {
-      prog.innerHTML = `<div class="msg" style="color:var(--danger)">${esc(msg)}</div>`;
+      prog.innerHTML = `<div class="msg">${esc('已取消')}</div>`;
     }
-  } else if (prog && (t.status === 'done' || t.status === 'error')) {
-    prog.remove();
+  } else if (t.status === 'error') {
+    if (!prog) {
+      const body = card.querySelector('.work-body');
+      const actions = body?.querySelector('.card-actions');
+      const html = `<div class="work-progress"><div class="msg" style="color:var(--danger)">合成失败</div></div>`;
+      if (actions) actions.insertAdjacentHTML('beforebegin', html);
+      else body?.insertAdjacentHTML('beforeend', html);
+    } else {
+      prog.innerHTML = `<div class="msg" style="color:var(--danger)">合成失败</div>`;
+    }
+  } else if (prog && (t.status === 'done' || t.status === 'error' || t.status === 'cancelled')) {
+    if (t.status === 'done') prog.remove();
   }
 
   const av = avatarForTask(t);
@@ -1101,9 +1137,11 @@ function renderMediaCard(t, isDoneFocus) {
   const playAttrs = playSrc
     ? `data-play="${esc(playSrc)}"${playFallback && playFallback !== playSrc ? ` data-play-fallback="${esc(playFallback)}"` : ''} data-title="${esc(t.task_name)}"`
     : `data-title="${esc(t.task_name)}"`;
+  const actionsHtml = mediaCardActionsHtml(t);
+  const actionsBlock = actionsHtml ? `<div class="card-actions">${actionsHtml}</div>` : '';
   return `<article class="media-card" data-task-id="${esc(t.task_id)}" ${playAttrs}>
     <div class="poster">${posterContent}<span class="badge-status ${st.cls}">${st.label}</span>${progressBlock}${playSrc ? playOverlay() : ''}</div>
-    <div class="card-body"><h3>${esc(t.task_name)}</h3><div class="sub">${esc(t.username || '')} · ${esc(av?.name || t.avatar_identifier || '—')}${t.quality_label ? ' · ' + esc(t.quality_label) : ''}</div></div>
+    <div class="card-body"><h3>${esc(t.task_name)}</h3><div class="sub">${esc(t.username || '')} · ${esc(av?.name || t.avatar_identifier || '—')}${t.quality_label ? ' · ' + esc(t.quality_label) : ''}</div>${actionsBlock}</div>
   </article>`;
 }
 
@@ -1126,7 +1164,9 @@ function renderWorkCard(t, opts = {}) {
   const actions = workCardActionsHtml(t);
   const progressHtml = (t.status === 'run' || t.status === 'wait') && pct >= 0
     ? `<div class="work-progress"><div class="bar"><i style="width:${pct}%"></i></div><div class="msg">${pct}% · ${esc(msg || '处理中…')}</div></div>`
-    : (t.status === 'error' && msg ? `<div class="work-progress"><div class="msg" style="color:var(--danger)">${esc(msg)}</div></div>` : '');
+    : (t.status === 'cancelled'
+      ? `<div class="work-progress"><div class="msg">已取消</div></div>`
+      : (t.status === 'error' ? `<div class="work-progress"><div class="msg" style="color:var(--danger)">合成失败</div></div>` : ''));
   const check = selectable
     ? `<label class="card-check" onclick="event.stopPropagation()"><input type="checkbox" data-select-work="${esc(t.task_id)}" ${selected ? 'checked' : ''}></label>`
     : '';
@@ -1560,7 +1600,7 @@ function selectAvatar(id, video, thumb) {
 
 async function handleTaskAction(e) {
   const taskLog = e.target.dataset.taskLog;
-  const stop = e.target.dataset.stop;
+  const cancel = e.target.dataset.cancel || e.target.dataset.stop;
   const retry = e.target.dataset.retry;
   const del = e.target.dataset.del;
   const play = e.target.dataset.play;
@@ -1569,21 +1609,24 @@ async function handleTaskAction(e) {
     openLightbox(play, e.target.dataset.title, e.target.dataset.playFallback || '');
     return;
   }
-  if (stop) {
-    const { data: r } = await api(`/api/tasks/${stop}/stop`, { method: 'POST' });
-    toast(r.msg || '已停止', r.code === 0 ? 'success' : 'error');
-    loadTasksAndRender(true);
+  if (cancel) {
+    if (!confirm('确定取消该合成任务？取消后记为已取消，可以再重试。')) return;
+    const { data: r } = await api(`/api/tasks/${encodeURIComponent(cancel)}/cancel`, { method: 'POST' });
+    toast(r.msg || '已取消', r.code === 0 ? 'success' : 'error');
+    await loadTasksAndRender(true);
+    return;
   }
   if (retry) {
-    const { data: r } = await api(`/api/tasks/${retry}/retry`, { method: 'POST' });
+    const { data: r } = await api(`/api/tasks/${encodeURIComponent(retry)}/retry`, { method: 'POST' });
     toast(r.msg || '已重试', r.code === 0 ? 'success' : 'error');
-    loadTasksAndRender(true);
+    await loadTasksAndRender(true);
+    return;
   }
   if (del && confirm('删除此作品？')) {
     const { data: r } = await api(`/api/tasks/${del}`, { method: 'DELETE' });
     toast(r.msg || '已删除', r.code === 0 ? 'success' : 'error');
     selectedWorkIds.delete(del);
-    loadTasksAndRender(true);
+    await loadTasksAndRender(true);
   }
 }
 
@@ -2508,6 +2551,11 @@ async function init() {
     const logBtn = e.target.closest('[data-task-log]');
     if (logBtn?.dataset.taskLog) {
       openTaskLog(logBtn.dataset.taskLog, logBtn.dataset.taskName, logBtn.dataset.taskStatus);
+      return;
+    }
+    const taskAct = e.target.closest('[data-cancel], [data-stop], [data-retry], [data-del]');
+    if (taskAct) {
+      await handleTaskAction({ target: taskAct });
       return;
     }
     const card = e.target.closest('[data-play]');

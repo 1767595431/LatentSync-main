@@ -960,28 +960,62 @@ def _job_preview(job: dict) -> Path:
         return output
 
 
+def _apply_cancel(job: dict) -> str:
+    jid = job["id"]
+    status = job.get("status")
+    if status == "cancelled":
+        return "已取消"
+    if status == "done":
+        raise HTTPException(400, "已完成的任务不能取消")
+    if status == "failed":
+        raise HTTPException(400, "已结束的任务不能取消")
+    tasks.request_cancel(jid)
+    with db.db() as conn:
+        updated = conn.execute(
+            """
+            UPDATE jobs
+            SET status = ?, error = NULL, finished_at = ?, stage = ?, remaining_seconds = 0, progress = ?
+            WHERE id = ? AND status IN ('queued', 'running')
+            """,
+            ("cancelled", db.utcnow(), "cancelled", tasks.CANCEL_MESSAGE, jid),
+        )
+        if updated.rowcount:
+            return "已取消"
+    latest = _find_job(jid)
+    st = latest.get("status") if latest else status
+    if st == "done":
+        tasks.clear_cancel(jid)
+        raise HTTPException(400, "已完成的任务不能取消")
+    if st == "cancelled":
+        return "已取消"
+    raise HTTPException(400, "无法取消")
+
+
 def _requeue_job(job: dict) -> None:
     if job["status"] == "running":
         raise HTTPException(400, "正在合成的任务不能重试")
     if not Path(job["audio_path"]).exists():
         raise HTTPException(400, "音频文件已丢失，无法重试")
+    tasks.clear_cancel(job["id"])
     job_dir = STORAGE / "jobs" / job["id"]
     for name in ("output.mp4", "preview.mp4"):
         (job_dir / name).unlink(missing_ok=True)
     duration = job.get("audio_duration") or probe_duration(job["audio_path"])
     estimated = estimate_seconds(int(job.get("steps") or DEFAULT_STEPS), duration)
     with db.db() as conn:
-        conn.execute(
+        updated = conn.execute(
             """
             UPDATE jobs
             SET status = ?, error = NULL, progress = ?, output_path = NULL, preview_path = NULL,
                 started_at = NULL, finished_at = NULL, stage = ?, progress_percent = 0,
                 remaining_seconds = ?, estimated_seconds = ?, current_chunk = NULL,
                 infer_started_at = NULL, tqdm_remaining = NULL
-            WHERE id = ?
+            WHERE id = ? AND status != ?
             """,
-            ("queued", "排队中", "queued", estimated, estimated, job["id"]),
+            ("queued", "排队中", "queued", estimated, estimated, job["id"], "running"),
         )
+        if not updated.rowcount:
+            raise HTTPException(400, "正在合成的任务不能重试")
 
 
 def _job_video(job_id: str) -> Path:
@@ -1026,6 +1060,18 @@ def retry_job(
     except HTTPException as exc:
         raise exc
     return {"ok": True, "id": job_id, "status": "queued"}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(
+    job_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    job = _visible_job(job_id, request, user_id, username)
+    msg = _apply_cancel(job)
+    return {"ok": True, "id": job_id, "msg": msg}
 
 
 @app.delete("/api/jobs/{job_id}")
@@ -1294,6 +1340,21 @@ def retry_task(
     return ok({"task_id": task_id}, "已重新排队")
 
 
+@app.post("/api/tasks/{task_id}/cancel")
+def cancel_task(
+    task_id: str,
+    request: Request,
+    user_id: Optional[str] = None,
+    username: Optional[str] = None,
+):
+    try:
+        job = _visible_job(task_id, request, user_id, username)
+        msg = _apply_cancel(job)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "无法取消")
+    return ok({"task_id": task_id}, msg)
+
+
 @app.get("/api/tasks/{task_id}/preview")
 def preview_task(task_id: str, request: Request):
     job = _visible_job_file(task_id, request)
@@ -1541,11 +1602,13 @@ _CN_DOCS = {
     ("GET", "/api/jobs/{job_id}/preview"): ("预览成片", "作品"),
     ("GET", "/api/jobs/{job_id}/download"): ("下载成片", "作品"),
     ("POST", "/api/jobs/{job_id}/retry"): ("重试合成任务", "作品"),
+    ("POST", "/api/jobs/{job_id}/cancel"): ("取消合成任务", "作品"),
     ("GET", "/api/tasks"): ("分页列出作品", "作品"),
     ("POST", "/api/tasks/create"): ("创建合成作品", "作品"),
     ("GET", "/api/tasks/{task_id}"): ("查询作品", "作品"),
     ("DELETE", "/api/tasks/{task_id}"): ("删除作品", "作品"),
     ("POST", "/api/tasks/{task_id}/retry"): ("重试合成", "作品"),
+    ("POST", "/api/tasks/{task_id}/cancel"): ("取消合成", "作品"),
     ("GET", "/api/tasks/{task_id}/preview"): ("预览作品成片", "作品"),
     ("GET", "/api/tasks/{task_id}/download"): ("下载作品成片", "作品"),
     ("GET", "/api/health"): ("简易健康检查", "系统"),

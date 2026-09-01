@@ -172,7 +172,7 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             job["progress_percent"] = 100
             job["remaining_seconds"] = 0
             job["stage"] = job.get("stage") or "done"
-        elif job.get("status") == "failed":
+        elif job.get("status") in {"failed", "cancelled"}:
             job["remaining_seconds"] = 0
         elif job.get("status") == "queued":
             job["progress_percent"] = 0
@@ -183,7 +183,7 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if job.get("status") != "running"
             else format_seconds(job.get("remaining_seconds"))
         )
-        if job.get("status") in {"done", "failed"}:
+        if job.get("status") in {"done", "failed", "cancelled"}:
             job["remaining_text"] = None
         job["progress_text"] = _progress_text(job)
     return items
@@ -194,8 +194,10 @@ def _progress_text(job: dict[str, Any]) -> str:
     stage = job.get("stage")
     if status == "done":
         return "已完成"
+    if status == "cancelled":
+        return "已取消"
     if status == "failed":
-        return job.get("error") or "失败"
+        return job.get("error") or "合成失败"
     if status == "queued":
         return "排队中"
     cur, total = job.get("current_chunk"), job.get("total_chunks")

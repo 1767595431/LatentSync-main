@@ -888,6 +888,7 @@ body::before {
 .badge-run { background: rgba(124,108,255,.35); color: #e9e5ff; animation: pulse 2s infinite; }
 .badge-done { background: rgba(52,211,153,.25); color: #a7f3d0; }
 .badge-error { background: rgba(248,113,113,.3); color: #fecaca; }
+.badge-cancel { background: rgba(148,163,184,.28); color: #e2e8f0; }
 .badge-bake { background: rgba(251,191,36,.28); color: #fde68a; animation: pulse 2s infinite; }
 
 .media-card.card-disabled { opacity: .72; }
@@ -1125,6 +1126,7 @@ body::before {
 .tag-run { background: rgba(124,108,255,.25); color: #c4b5fd; }
 .tag-done { background: rgba(52,211,153,.2); color: #6ee7b7; }
 .tag-error { background: rgba(248,113,113,.2); color: #fca5a5; }
+.tag-cancel { background: rgba(148,163,184,.22); color: #cbd5e1; }
 
 .work-progress {
   margin-top: 12px;

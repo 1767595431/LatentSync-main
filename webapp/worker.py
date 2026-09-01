@@ -15,7 +15,7 @@ _path = os.environ.get("PATH", "")
 if _env_bin not in _path.split(os.pathsep):
     os.environ["PATH"] = _env_bin + (os.pathsep + _path if _path else "")
 
-from . import db
+from . import db, tasks
 from .config import (
     GUIDANCE_SCALE,
     PYTHON,
@@ -39,6 +39,12 @@ from .progress import parse_job_line
 
 _stop = threading.Event()
 _thread: Optional[threading.Thread] = None
+
+
+class JobCancelled(Exception):
+    pass
+
+
 _char_thread: Optional[threading.Thread] = None
 _gpu_lock = threading.Lock()
 _busy_gpus: dict[int, str] = {}
@@ -67,6 +73,9 @@ def _recover_stale() -> None:
         rows = conn.execute("SELECT id FROM jobs WHERE status = ?", ("running",)).fetchall()
         for row in rows:
             if row["id"] in adopted:
+                continue
+            if tasks.is_cancel_requested(row["id"]):
+                _mark_job_cancelled(row["id"])
                 continue
             conn.execute(
                 """
@@ -117,6 +126,36 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _kill_process_group(pid: int) -> None:
+    if pid <= 0:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pid, sig)
+        except OSError:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                return
+        deadline = time.time() + (5 if sig == signal.SIGTERM else 2)
+        while time.time() < deadline:
+            if not _pid_alive(pid):
+                return
+            time.sleep(0.15)
+
+
+def _mark_job_cancelled(job_id: str) -> None:
+    with db.db() as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = ?, error = NULL, finished_at = ?, stage = ?, remaining_seconds = 0, progress = ?
+            WHERE id = ? AND status = ?
+            """,
+            ("cancelled", db.utcnow(), "cancelled", tasks.CANCEL_MESSAGE, job_id, "running"),
+        )
+
+
 def _catch_up_job_log(log_path: Path, job: dict) -> int:
     """Parse recent tqdm lines into DB. Returns size to keep following from."""
     try:
@@ -156,6 +195,9 @@ def _follow_job_log(pid: int, log_path: Path, start_off: int, job: dict) -> None
                             buf += extra.decode("utf-8", errors="replace")
                             _consume_progress_buf(buf, job)
                         return
+                    if tasks.is_cancel_requested(job.get("id")):
+                        _kill_process_group(pid)
+                        return
                     time.sleep(0.15)
         except FileNotFoundError:
             if not _pid_alive(pid):
@@ -174,10 +216,16 @@ def _watch_adopted(pid: int, gpu_id: int, job_id: Optional[str]) -> None:
             _follow_job_log(pid, log_path, start_off, job)
         else:
             while _pid_alive(pid):
+                if tasks.is_cancel_requested(job_id):
+                    _kill_process_group(pid)
+                    break
                 time.sleep(1)
         if not job_id:
             return
         output_path = STORAGE / "jobs" / job_id / "output.mp4"
+        if tasks.is_cancel_requested(job_id):
+            _mark_job_cancelled(job_id)
+            return
         if output_path.exists() and output_path.stat().st_size >= 1000:
             _mark_job_done(job_id, output_path, only_if_running=True)
         else:
@@ -195,6 +243,9 @@ def _watch_adopted(pid: int, gpu_id: int, job_id: Optional[str]) -> None:
 
 
 def _mark_job_done(job_id: str, output_path: Path, *, only_if_running: bool = False) -> None:
+    if tasks.is_cancel_requested(job_id):
+        _mark_job_cancelled(job_id)
+        return
     preview_path = output_path.parent / "preview.mp4"
     preview_stored = None
     try:
@@ -207,7 +258,7 @@ def _mark_job_done(job_id: str, output_path: Path, *, only_if_running: bool = Fa
         SET status = ?, progress = ?, output_path = ?, preview_path = ?, finished_at = ?, error = NULL,
             progress_percent = 100, remaining_seconds = 0, stage = ?, tqdm_remaining = 0,
             progress_updated_at = ?
-        WHERE id = ?
+        WHERE id = ? AND status = ?
     """
     args = (
         "done",
@@ -218,10 +269,8 @@ def _mark_job_done(job_id: str, output_path: Path, *, only_if_running: bool = Fa
         "done",
         db.utcnow(),
         job_id,
+        "running",
     )
-    if only_if_running:
-        sql += " AND status = ?"
-        args = args + ("running",)
     with db.db() as conn:
         conn.execute(sql, args)
 
@@ -638,7 +687,17 @@ def _try_start_jobs() -> None:
             raise
 
 
+def _live_inference_job_ids() -> set[str]:
+    ids: set[str] = set()
+    for pid in inference_pids():
+        job_id = job_id_from_pid(pid)
+        if job_id:
+            ids.add(job_id)
+    return ids
+
+
 def _claim_next_job() -> Optional[dict]:
+    live_ids = _live_inference_job_ids()
     with db.db() as conn:
         rows = conn.execute(
             """
@@ -667,19 +726,33 @@ def _claim_next_job() -> Optional[dict]:
                     ("failed", "形象视频或音频文件缺失", db.utcnow(), "failed", item["id"]),
                 )
                 continue
+            if tasks.is_cancel_requested(item["id"]):
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, error = NULL, finished_at = ?, stage = ?, remaining_seconds = 0, progress = ?
+                    WHERE id = ? AND status = ?
+                    """,
+                    ("cancelled", db.utcnow(), "cancelled", tasks.CANCEL_MESSAGE, item["id"], "queued"),
+                )
+                continue
+            if item["id"] in live_ids:
+                continue
             job = item
             break
         if job is None:
             return None
-        conn.execute(
+        claimed = conn.execute(
             """
             UPDATE jobs
             SET status = ?, progress = ?, stage = ?, started_at = ?, error = NULL,
                 progress_percent = 0, remaining_seconds = estimated_seconds, progress_updated_at = ?
-            WHERE id = ?
+            WHERE id = ? AND status = ?
             """,
-            ("running", "加载模型", "loading", db.utcnow(), db.utcnow(), job["id"]),
+            ("running", "加载模型", "loading", db.utcnow(), db.utcnow(), job["id"], "queued"),
         )
+        if not claimed.rowcount:
+            return None
     return job
 
 
@@ -691,6 +764,11 @@ def _execute_job(job: dict, gpu_id: int) -> None:
     temp_dir = job_dir / "temp"
     if temp_dir.exists():
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+    if tasks.is_cancel_requested(job_id):
+        _mark_job_cancelled(job_id)
+        _release_gpu(gpu_id)
+        return
 
     cmd = [
         PYTHON,
@@ -735,25 +813,34 @@ def _execute_job(job: dict, gpu_id: int) -> None:
         finally:
             log_f.close()
         code = _drain_inference_log(proc, log_path, start_off, job)
+        if tasks.is_cancel_requested(job_id):
+            raise JobCancelled()
         if code != 0 or not output_path.exists() or output_path.stat().st_size < 1000:
             raise RuntimeError(f"合成失败，退出码 {code}")
         _mark_job_done(job_id, output_path)
+    except JobCancelled:
+        _mark_job_cancelled(job_id)
     except Exception as exc:
-        with db.db() as conn:
-            conn.execute(
-                """
-                UPDATE jobs
-                SET status = ?, error = ?, finished_at = ?, stage = ?, remaining_seconds = 0
-                WHERE id = ?
-                """,
-                ("failed", str(exc), db.utcnow(), "failed", job_id),
-            )
+        if tasks.is_cancel_requested(job_id):
+            _mark_job_cancelled(job_id)
+        else:
+            with db.db() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, error = ?, finished_at = ?, stage = ?, remaining_seconds = 0
+                    WHERE id = ? AND status = ?
+                    """,
+                    ("failed", str(exc), db.utcnow(), "failed", job_id, "running"),
+                )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
         _release_gpu(gpu_id)
 
 
 def _update_job_progress(job_id: str, fields: dict) -> None:
+    if tasks.is_cancel_requested(job_id):
+        return
     now = db.utcnow()
     assignments = ["progress_updated_at = ?"]
     values: list = [now]
@@ -774,7 +861,8 @@ def _update_job_progress(job_id: str, fields: dict) -> None:
         assignments.append("infer_started_at = COALESCE(infer_started_at, ?)")
         values.append(now)
     values.append(job_id)
-    sql = f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ?"
+    values.append("running")
+    sql = f"UPDATE jobs SET {', '.join(assignments)} WHERE id = ? AND status = ?"
     with db.db() as conn:
         conn.execute(sql, values)
 
@@ -797,6 +885,14 @@ def _drain_inference_log(proc: subprocess.Popen, log_path: Path, start_off: int,
                     buf = _consume_progress_buf(buf, job)
                     extra = rf.read(4096)
                 return code
+            if tasks.is_cancel_requested(job.get("id")):
+                _kill_process_group(proc.pid)
+                deadline = time.time() + 8
+                while proc.poll() is None and time.time() < deadline:
+                    time.sleep(0.1)
+                if proc.poll() is None:
+                    _kill_process_group(proc.pid)
+                raise JobCancelled()
             time.sleep(0.1)
 
 

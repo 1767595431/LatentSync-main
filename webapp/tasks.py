@@ -1,14 +1,41 @@
+from pathlib import Path
 from typing import Optional
 
 from . import avatars
-from .config import DEFAULT_STEPS
+from .config import DEFAULT_STEPS, STORAGE
 from .progress import enrich_jobs, format_seconds
+
+CANCEL_MESSAGE = "已取消"
+_CANCEL_FLAG = "cancel.flag"
+
+
+def job_dir(job_id: str) -> Path:
+    return STORAGE / "jobs" / job_id
+
+
+def cancel_flag_path(job_id: str) -> Path:
+    return job_dir(job_id) / _CANCEL_FLAG
+
+
+def request_cancel(job_id: str) -> None:
+    path = cancel_flag_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("1", encoding="utf-8")
+
+
+def clear_cancel(job_id: str) -> None:
+    cancel_flag_path(job_id).unlink(missing_ok=True)
+
+
+def is_cancel_requested(job_id: Optional[str]) -> bool:
+    return bool(job_id) and cancel_flag_path(job_id).exists()
 
 STATUS_OUT = {
     "queued": "wait",
     "running": "run",
     "done": "done",
     "failed": "error",
+    "cancelled": "cancelled",
 }
 STATUS_IN = {
     "wait": "queued",
@@ -18,6 +45,8 @@ STATUS_IN = {
     "done": "done",
     "error": "failed",
     "failed": "failed",
+    "cancelled": "cancelled",
+    "cancel": "cancelled",
 }
 QUALITY = {
     30: "标准",
@@ -49,7 +78,7 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
         remaining = None
         remain = None
     else:
-        remaining = 0 if status in {"done", "error"} else job.get("remaining_seconds")
+        remaining = 0 if status in {"done", "error", "cancelled"} else job.get("remaining_seconds")
         remain = None
     return {
         "task_id": tid,
@@ -64,8 +93,12 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
         "avatar_bake_status": avatar["bake_status"] if avatar else "missing",
         "status": status,
         "progress": float(job.get("progress_percent") or 0),
-        "progress_message": job.get("progress_text") or job.get("progress") or "",
-        "error_message": job.get("error") or "",
+        "progress_message": (
+            "已取消" if status == "cancelled"
+            else "合成失败" if status == "error"
+            else (job.get("progress_text") or job.get("progress") or "")
+        ),
+        "error_message": "" if status == "cancelled" else (job.get("error") or ""),
         "result_path": preview,
         "result_thumbnail": (avatar or {}).get("thumbnail") if done else "",
         "result_path_lbr": preview,
@@ -81,6 +114,20 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
     }
 
 
+def canonicalize_job(job: dict) -> dict:
+    job = dict(job)
+    if job.get("status") == "failed" and (
+        job.get("error") == CANCEL_MESSAGE
+        or job.get("progress") == CANCEL_MESSAGE
+        or job.get("stage") == "cancelled"
+    ):
+        job["status"] = "cancelled"
+        job["error"] = None
+        job["progress"] = CANCEL_MESSAGE
+        job["stage"] = "cancelled"
+    return job
+
+
 def load_jobs(conn) -> list[dict]:
     rows = conn.execute(
         """
@@ -91,7 +138,7 @@ def load_jobs(conn) -> list[dict]:
         ORDER BY jobs.created_at DESC
         """
     ).fetchall()
-    return enrich_jobs([dict(r) for r in rows])
+    return enrich_jobs([canonicalize_job(dict(r)) for r in rows])
 
 
 def character_map(conn) -> dict[str, dict]:
@@ -114,8 +161,12 @@ def filter_jobs(
     elif not include_private:
         items = [j for j in items if (j.get("character_type") or "public") != "private"]
     if status and status != "all":
-        inner = STATUS_IN.get(status, status)
-        items = [j for j in items if j.get("status") == inner]
+        key = status.strip().lower()
+        if key in {"active", "live"}:
+            items = [j for j in items if j.get("status") in {"queued", "running"}]
+        else:
+            inner = STATUS_IN.get(key, key)
+            items = [j for j in items if j.get("status") == inner]
     if keyword:
         q = keyword.strip().lower()
         items = [

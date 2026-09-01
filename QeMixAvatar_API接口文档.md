@@ -86,7 +86,7 @@ http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public
 
 | 场景 | 怎么传 |
 |---|---|
-| 查询、删除、重试、重新转码 | Query：`username` 或 `user_id`，二选一 |
+| 查询、删除、重试、取消、重新转码 | Query：`username` 或 `user_id`，二选一 |
 | 创建作品 | Form 字段名固定为 `username`（必填，公共形象也要填） |
 | 读取个人封面 / 形象视频 / 个人成片 | 请求头 `X-User-Id` 或 `X-Username`，必须与所有者一致 |
 
@@ -123,9 +123,10 @@ http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public
 | `wait` | 排队中 |
 | `run` | 合成中 |
 | `done` | 已完成，可预览/下载 |
-| `error` | 失败，可重试 |
+| `cancelled` | 已取消，可重试 |
+| `error` | 合成失败，可重试 |
 
-查询列表的 `status` 也接受 `queued` / `running` / `failed`，返回值仍是上表四档。
+查询列表的 `status` 也接受 `queued` / `running` / `failed` / `cancelled` / `active`（排队中+合成中），返回值仍是上表。取消成功后 `status` 为 `cancelled`，界面和接口都显示已取消，不会变成 `error`。只有真正合成失败才是 `error`。
 
 ### 1.6 合成质量
 
@@ -172,7 +173,7 @@ X-User-Id: u1001
 1. `GET /api/avatars?type=public` 选用公共形象，或按 4.2 上传个人形象（多个视频可并行，见 4.2）。
 2. 个人形象上传后轮询列表，直到该条 `bake_status=ready`。
 3. `POST /api/tasks/create` 提交音频，拿到 `task_id`。
-4. `GET /api/tasks/{task_id}?username=<用户ID>` 轮询，直到 `status=done` 或 `error`。
+4. `GET /api/tasks/{task_id}?username=<用户ID>` 轮询，直到 `status=done`、`error` 或 `cancelled`。排队或合成中可 `POST /api/tasks/{task_id}/cancel` 取消；成功后该条即为 `cancelled`（不是 `error`），队列里下一条会自动开始，不必为取消再轮询。
 5. `status=done` 后：预览用 `result_path`（低码率），保存原片用 `GET /api/tasks/{task_id}/download`。个人成片两次请求都要带 `X-User-Id`。
 
 ---
@@ -191,7 +192,8 @@ X-User-Id: u1001
 | GET | `/api/tasks` | 分页列出作品 |
 | POST | `/api/tasks/create` | 创建合成作品 |
 | GET | `/api/tasks/{task_id}` | 查询单个作品（轮询） |
-| POST | `/api/tasks/{task_id}/retry` | 失败/完成后重试 |
+| POST | `/api/tasks/{task_id}/cancel` | 取消排队中或合成中的作品 |
+| POST | `/api/tasks/{task_id}/retry` | 合成失败或已取消后重试 |
 | GET | `/api/tasks/{task_id}/preview` | 成片预览（mp4，低码率，带声音） |
 | GET | `/api/tasks/{task_id}/download` | 成片原片下载 |
 | DELETE | `/api/tasks/{task_id}` | 删除作品 |
@@ -578,10 +580,10 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `avatar_thumbnail` | string | 形象封面相对路径 |
 | `avatar_preview_video` / `avatar_video_path` | string | 形象预览视频相对路径 |
 | `avatar_bake_status` | string | 形象转码状态 |
-| `status` | string | `wait` / `run` / `done` / `error` |
+| `status` | string | `wait` / `run` / `done` / `cancelled` / `error` |
 | `progress` | number | 0～100 |
-| `progress_message` | string | 进度说明 |
-| `error_message` | string | 失败原因 |
+| `progress_message` | string | 进度说明；已取消为 `已取消`，合成失败时为 `合成失败` |
+| `error_message` | string | 仅 `status=error` 时的失败原因；已取消时为空 |
 | `result_path` / `result_path_lbr` | string | 完成后的预览地址，未完成时为空。值为 `/api/tasks/{task_id}/preview` |
 | `result_thumbnail` | string | 完成后的封面（当前为形象封面） |
 | `steps` | int | 合成步数 |
@@ -605,7 +607,7 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `page` | int | 否 | 默认 `1` |
 | `page_size` | int | 否 | 默认 `12`，最大 `100` |
 | `username` 或 `user_id` | string | 强烈建议 | 按提交用户筛选 |
-| `status` | string | 否 | `wait` / `run` / `done` / `error`（也接受 `queued` / `running` / `failed`） |
+| `status` | string | 否 | `wait` / `run` / `done` / `cancelled` / `error`（也接受 `queued` / `running` / `failed`；`active` 表示排队中+合成中） |
 | `keyword` | string | 否 | 搜索作品名、音频名、形象名 |
 
 成功 `data`：
@@ -684,15 +686,38 @@ curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/tasks/create \
 curl -s "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>?username=u1001"
 ```
 
-建议间隔 2～5 秒轮询，`status` 为 `done` 或 `error` 后停止。
+建议间隔 2～5 秒轮询，`status` 为 `done`、`error` 或 `cancelled` 后停止。
 
 ---
 
-### 6.4 重试合成
+### 6.4 取消合成
+
+`POST /api/tasks/{task_id}/cancel`
+
+个人作品请带 Query `username` 或 `user_id`。`status=wait`（排队）或 `status=run`（合成中）可取消。已经是 `cancelled` 再调用一次仍返回 `已取消`。
+
+成功后该条立刻变为 `cancelled`，`progress_message` 为 `已取消`，`error_message` 为空，`msg` 为 `已取消`，可以再调用重试。合成中取消后 GPU 会空出，队列里下一条自动开始，不必再轮询这条任务。已取消**不是**失败，`status` 不会是 `error`。
+
+已完成、已失败的任务不能取消；合成中请用本接口，不要直接删除。
+
+| `msg` | 场景 |
+|---|---|
+| `已取消` | 排队中或合成中的任务已取消 |
+| `任务不存在` | ID 无效或不属于该用户 |
+| `已完成的任务不能取消` | `status=done` |
+| `已结束的任务不能取消` | `status=error` |
+
+```bash
+curl -s -X POST "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/cancel?username=u1001"
+```
+
+---
+
+### 6.5 重试合成
 
 `POST /api/tasks/{task_id}/retry`
 
-个人作品请带 Query `username` 或 `user_id`。合成中（`status=run`）不能重试。音频文件必须仍在。成功后重新进入排队，`msg` 为 `已重新排队`。
+个人作品请带 Query `username` 或 `user_id`。合成中（`status=run`）不能重试。`status=error`（合成失败）或 `status=cancelled`（已取消）后都可重试。音频文件必须仍在。成功后重新进入排队，`msg` 为 `已重新排队`。
 
 | `msg` | 场景 |
 |---|---|
@@ -706,13 +731,13 @@ curl -s -X POST "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/retr
 
 ---
 
-### 6.5 预览成片（低码率）
+### 6.6 预览成片（低码率）
 
 `GET /api/tasks/{task_id}/preview`
 
 使用了**个人形象**的作品必须带请求头 `X-User-Id`。裸 URL、分享链接、`?user_id=` 均无法打开。
 
-成功：HTTP `200`，`Content-Type: video/mp4`。原分辨率、约 2Mbps、**带声音**（AAC）。个人成片带 `Cache-Control: private, no-store`。无损原片请用 6.6 下载。
+成功：HTTP `200`，`Content-Type: video/mp4`。原分辨率、约 2Mbps、**带声音**（AAC）。个人成片带 `Cache-Control: private, no-store`。无损原片请用 6.7 下载。
 
 | HTTP | `detail` | 场景 |
 |---|---|---|
@@ -732,11 +757,11 @@ curl -o preview.mp4 "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>/
 
 ---
 
-### 6.6 下载成片（原片）
+### 6.7 下载成片（原片）
 
 `GET /api/tasks/{task_id}/download`
 
-鉴权、失败情况与 6.5 相同。成功时另有：
+鉴权、失败情况与 6.6 相同。成功时另有：
 
 ```http
 Content-Disposition: attachment; filename="{task_id}.mp4"
@@ -749,11 +774,11 @@ curl -H "X-User-Id: u1001" -OJ \
 
 ---
 
-### 6.7 删除作品
+### 6.8 删除作品
 
 `DELETE /api/tasks/{task_id}`
 
-个人作品请带 Query `username` 或 `user_id`。合成中不能删除。
+个人作品请带 Query `username` 或 `user_id`。合成中不能删除，请先取消。
 
 成功 `msg`：`已删除`。
 
