@@ -217,6 +217,10 @@
                     <input type="file" name="audio" accept="audio/*" required>
                     <div class="icon">🎵</div>
                     <p id="audioLabel">拖拽或点击选择 wav / mp3</p>
+                    <div class="audio-up-progress hidden" id="audioUpProgress">
+                      <div class="audio-up-bar"><i id="audioUpBar"></i></div>
+                      <span id="audioUpText">上传中 0%</span>
+                    </div>
                   </label>
                 </div>
                 <button type="submit" class="btn btn-primary" id="taskSubmit">开始合成</button>

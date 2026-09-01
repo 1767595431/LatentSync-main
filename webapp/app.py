@@ -1154,7 +1154,8 @@ async def create_task(
     avatar_identifier: str = Form(..., title="形象ID"),
     username: str = Form(..., title="用户ID"),
     task_name: str = Form(..., title="作品名称"),
-    audio: UploadFile = File(..., title="驱动音频"),
+    audio: Optional[UploadFile] = File(None, title="驱动音频"),
+    audio_upload_id: Optional[str] = Form(None, title="已完成的音频分片上传ID"),
     steps: int = Form(DEFAULT_STEPS, title="合成质量步数"),
 ):
     name = (task_name or "").strip()
@@ -1165,9 +1166,9 @@ async def create_task(
         return fail("请填写用户ID")
     if steps not in ALLOWED_STEPS:
         return fail(f"步数只能是 {', '.join(map(str, ALLOWED_STEPS))}")
-    ext = _ext(audio.filename or "")
-    if ext not in AUDIO_EXTS:
-        return fail(f"不支持的音频格式：{ext or '未知'}")
+    upload_id = (audio_upload_id or "").strip()
+    if not upload_id and (audio is None or not (audio.filename or "").strip()):
+        return fail("请上传音频")
     with db.db() as conn:
         char = conn.execute("SELECT * FROM characters WHERE id = ?", (avatar_identifier,)).fetchone()
         if char is None:
@@ -1181,16 +1182,55 @@ async def create_task(
             return fail("形象不存在")
         except ValueError as exc:
             return fail(str(exc))
-    data = await audio.read()
-    if not data:
-        return fail("音频文件为空")
-    if len(data) > MAX_AUDIO_SIZE:
-        return fail("音频不能超过 300MB")
+
     job_id = uuid.uuid4().hex
     job_dir = STORAGE / "jobs" / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    audio_path = job_dir / f"audio{ext or '.wav'}"
-    audio_path.write_bytes(data)
+
+    def _fail_audio(msg: str):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return fail(msg)
+
+    try:
+        if upload_id:
+            try:
+                uid = avatars.parse_upload_id(upload_id)
+            except FileNotFoundError:
+                return _fail_audio("音频上传不存在")
+            with db.db() as conn:
+                row = conn.execute("SELECT * FROM uploads WHERE id = ?", (uid,)).fetchone()
+            if row is None:
+                return _fail_audio("音频上传不存在")
+            upload = dict(row)
+            if upload["kind"] != "audio" or upload["status"] != "ready" or not upload.get("path"):
+                return _fail_audio("请先完成音频分片上传")
+            src = Path(upload["path"])
+            if not src.exists() or src.stat().st_size < 1:
+                return _fail_audio("音频文件不存在")
+            if src.stat().st_size > MAX_AUDIO_SIZE:
+                return _fail_audio("音频不能超过 300MB")
+            ext = _ext(upload["filename"] or src.name)
+            if ext not in AUDIO_EXTS:
+                return _fail_audio(f"不支持的音频格式：{ext or '未知'}")
+            audio_path = job_dir / f"audio{ext or '.wav'}"
+            shutil.copy2(src, audio_path)
+            audio_name = _safe_name(upload["filename"] or audio_path.name)
+        else:
+            ext = _ext(audio.filename or "")
+            if ext not in AUDIO_EXTS:
+                return _fail_audio(f"不支持的音频格式：{ext or '未知'}")
+            data = await audio.read()
+            if not data:
+                return _fail_audio("音频文件为空")
+            if len(data) > MAX_AUDIO_SIZE:
+                return _fail_audio("音频不能超过 300MB")
+            audio_path = job_dir / f"audio{ext or '.wav'}"
+            audio_path.write_bytes(data)
+            audio_name = _safe_name(audio.filename or audio_path.name)
+    except Exception:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise
+
     duration = probe_duration(str(audio_path))
     total_chunks = chunks_from_duration(duration)
     estimated = estimate_seconds(steps, duration)
@@ -1208,7 +1248,7 @@ async def create_task(
                 job_id,
                 avatar_identifier,
                 str(audio_path),
-                _safe_name(audio.filename or audio_path.name),
+                audio_name,
                 steps,
                 db.utcnow(),
                 duration,

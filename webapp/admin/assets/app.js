@@ -2011,6 +2011,88 @@ function bindUploadUi() {
 
 /* ---- Forms ---- */
 
+function uploadErrorMessage(payload, fallback) {
+  if (!payload) return fallback;
+  if (typeof payload.detail === 'string') return payload.detail;
+  return payload.msg || payload.message || payload.detail || fallback;
+}
+
+function setAudioUploadProgress(pct, text) {
+  const drop = $('#audioDrop');
+  const box = $('#audioUpProgress');
+  const bar = $('#audioUpBar');
+  const label = $('#audioUpText');
+  if (pct == null) {
+    drop?.classList.remove('is-uploading');
+    box?.classList.add('hidden');
+    if (bar) bar.style.width = '0%';
+    const btn = $('#taskSubmit');
+    if (btn) btn.textContent = '开始合成';
+    return;
+  }
+  const n = Math.max(0, Math.min(100, Math.round(pct)));
+  drop?.classList.add('is-uploading');
+  box?.classList.remove('hidden');
+  if (bar) bar.style.width = `${n}%`;
+  if (label) label.textContent = text || `上传中 ${n}%`;
+  const btn = $('#taskSubmit');
+  if (btn) btn.textContent = text || `上传中 ${n}%`;
+}
+
+async function abortGenericUpload(uploadId) {
+  if (!uploadId) return;
+  try {
+    await api(`/api/uploads/${encodeURIComponent(uploadId)}`, { method: 'DELETE', timeoutMs: 15000 });
+  } catch {
+    /* ignore */
+  }
+}
+
+async function uploadAudioInChunks(file, { signal, onProgress } = {}) {
+  const { ok, data: ir } = await api('/api/uploads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      kind: 'audio',
+      filename: file.name,
+      size: file.size,
+      mime: file.type || 'application/octet-stream',
+    }),
+    signal,
+    timeoutMs: 30000,
+  });
+  if (!ok) throw new Error(uploadErrorMessage(ir, '初始化上传失败'));
+  const uid = ir.upload_id;
+  const chunkSize = Number(ir.chunk_size) || UPLOAD_CHUNK;
+  const total = Number(ir.total_chunks) || Math.max(1, Math.ceil(file.size / chunkSize));
+  if (!uid) throw new Error('未返回上传ID');
+  try {
+    for (let i = 0; i < total; i++) {
+      if (signal?.aborted) throw new Error('已取消');
+      const blob = file.slice(i * chunkSize, (i + 1) * chunkSize);
+      const { ok: cok, data: cr } = await api(`/api/uploads/${encodeURIComponent(uid)}/chunks/${i}`, {
+        method: 'PUT',
+        body: blob,
+        signal,
+        timeoutMs: 180000,
+      });
+      if (!cok) throw new Error(uploadErrorMessage(cr, '分片上传失败'));
+      onProgress?.(Math.round(((i + 1) / total) * 100), i + 1, total);
+    }
+    const { ok: dok, data: dr } = await api(`/api/uploads/${encodeURIComponent(uid)}/complete`, {
+      method: 'POST',
+      signal,
+      timeoutMs: 120000,
+    });
+    if (!dok) throw new Error(uploadErrorMessage(dr, '合并音频失败'));
+    onProgress?.(100, total, total);
+    return uid;
+  } catch (err) {
+    abortGenericUpload(uid);
+    throw err;
+  }
+}
+
 $('#taskForm')?.addEventListener('submit', async (e) => {
   e.preventDefault();
   if (!pickedAvatarId) return toast('请先选择形象', 'error');
@@ -2022,23 +2104,38 @@ $('#taskForm')?.addEventListener('submit', async (e) => {
   } catch (err) {
     return toast(err.message, 'error');
   }
-  const fd = new FormData(form);
-  fd.set('avatar_identifier', pickedAvatarId);
-  const steps = form.querySelector('input[name="steps"]:checked')?.value || '30';
-  fd.set('steps', steps);
-  $('#taskSubmit').disabled = true;
+  const btn = $('#taskSubmit');
+  const abortCtrl = new AbortController();
+  btn.disabled = true;
+  setAudioUploadProgress(0, '准备上传…');
   try {
-    const { data: r } = await api('/api/tasks/create', { method: 'POST', body: fd });
-    if (r.code !== 0) throw new Error(r.msg);
+    const uid = await uploadAudioInChunks(audioFile, {
+      signal: abortCtrl.signal,
+      onProgress: (pct, cur, total) => setAudioUploadProgress(pct, `上传音频 ${cur}/${total} · ${pct}%`),
+    });
+    setAudioUploadProgress(100, '提交合成任务…');
+    const fd = new FormData(form);
+    fd.delete('audio');
+    fd.set('avatar_identifier', pickedAvatarId);
+    fd.set('audio_upload_id', uid);
+    const steps = form.querySelector('input[name="steps"]:checked')?.value || '30';
+    fd.set('steps', steps);
+    const { data: r } = await api('/api/tasks/create', { method: 'POST', body: fd, timeoutMs: 60000 });
+    if (r.code !== 0) throw new Error(r.msg || r.detail || '创建失败');
     toast('已开始合成，可在作品库查看进度', 'success');
     form.reset();
-    $('#audioLabel').textContent = '选择 wav / mp3 音频';
+    $('#audioLabel').textContent = '拖拽或点击选择 wav / mp3';
+    setAudioUploadProgress(null);
     await loadTasksAndRender(true);
     go('works');
   } catch (err) {
     toast(err.message, 'error');
+    setAudioUploadProgress(null);
   } finally {
-    $('#taskSubmit').disabled = false;
+    btn.disabled = false;
+    if ($('#taskSubmit') && !$('#audioDrop')?.classList.contains('is-uploading')) {
+      $('#taskSubmit').textContent = '开始合成';
+    }
   }
 });
 
