@@ -23,16 +23,45 @@
   const FX = {
     silent: false,
     _silentDepth: 0,
+    _swapBusy: 0,
+    _userPaint: 0,
+
+    beginUserPaint() {
+      this._userPaint += 1;
+      this._syncSilentClass();
+    },
+
+    endUserPaint() {
+      this._userPaint = Math.max(0, this._userPaint - 1);
+      this._syncSilentClass();
+    },
+
+    isBusy() {
+      return this._swapBusy > 0 || this._userPaint > 0;
+    },
+
+    _syncSilentClass() {
+      const mute = this.silent && this._userPaint === 0 && this._swapBusy === 0;
+      document.documentElement.classList.toggle('fx-silent', mute);
+    },
 
     setSilent(on) {
+      const was = this._silentDepth > 0;
       if (on) this._silentDepth += 1;
       else this._silentDepth = Math.max(0, this._silentDepth - 1);
       this.silent = this._silentDepth > 0;
-      document.documentElement.classList.toggle('fx-silent', this.silent);
+      // html.fx-silent sets animation:none. If zoomIn classes stay on the node,
+      // lifting silent restarts the keyframes — cards appear to animate twice.
+      if (this.silent && !was && this._userPaint === 0 && this._swapBusy === 0) {
+        document.querySelectorAll('.animate__animated').forEach((el) => stripAnimate(el));
+      }
+      this._syncSilentClass();
     },
 
     shouldAnimate(prefer = true) {
-      return !!prefer && !this.silent && !reduced();
+      if (!prefer || reduced()) return false;
+      if (this._userPaint > 0) return true;
+      return !this.silent;
     },
 
     run(el, name, duration = 400, delay = 0, opts = {}) {
@@ -77,14 +106,14 @@
 
     revealChildren(root, selector = '.media-card, .work-card, .empty-state, .empty-state.inline, .stat-pill', opts = {}) {
       const { prefer = true } = opts;
-      if (!root || !this.shouldAnimate(prefer)) return;
+      if (!root || !this.shouldAnimate(prefer)) return Promise.resolve();
       const {
         animation = 'zoomIn',
         duration = 650,
         stagger = 28,
       } = opts;
       const nodes = root.matches?.(selector) ? [root] : [...root.querySelectorAll(selector)];
-      nodes.forEach((el, i) => this.run(el, animation, duration, i * stagger));
+      return Promise.all(nodes.map((el, i) => this.run(el, animation, duration, i * stagger)));
     },
 
     hideChildren(root, selector = '.media-card, .work-card, .empty-state, .empty-state.inline', opts = {}) {
@@ -99,13 +128,20 @@
       if (!root) return;
       const gen = (root._fxGen || 0) + 1;
       root._fxGen = gen;
-      if (this.shouldAnimate(prefer) && root.children.length) {
-        await this.hideChildren(root);
+      this._swapBusy += 1;
+      this._syncSilentClass();
+      try {
+        if (this.shouldAnimate(prefer) && root.children.length) {
+          await this.hideChildren(root);
+          if (root._fxGen !== gen) return;
+        }
+        root.innerHTML = html;
         if (root._fxGen !== gen) return;
+        if (this.shouldAnimate(prefer)) await this.revealChildren(root);
+      } finally {
+        this._swapBusy = Math.max(0, this._swapBusy - 1);
+        this._syncSilentClass();
       }
-      root.innerHTML = html;
-      if (root._fxGen !== gen) return;
-      if (this.shouldAnimate(prefer)) this.revealChildren(root);
     },
 
     toastIn(el) {

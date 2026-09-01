@@ -46,6 +46,15 @@ let taskLogPollTimer = null;
 let taskLogOpenId = null;
 
 const PAGE_SIZE = { works: 15, avatars: 15 };
+const gridPaintSeq = { works: 0, avatars: 0, create: 0 };
+
+function beginUserGridPaint(animate) {
+  if (animate) FX?.beginUserPaint?.();
+}
+
+function endUserGridPaint(animate) {
+  if (animate) FX?.endUserPaint?.();
+}
 
 const HOME_FILTERS = {
   'avatar-public': { label: '公共形象' },
@@ -355,6 +364,7 @@ async function refreshSystemStatsQuiet() {
 }
 
 async function pollAvatarPagesQuiet() {
+  if (FX?.isBusy?.()) return;
   FX?.setSilent(true);
   try {
     await refreshAvatarCounts();
@@ -790,6 +800,7 @@ function scheduleBakePoll() {
   }
   if (bakePollTimer) return;
   bakePollTimer = setInterval(async () => {
+    if (FX?.isBusy?.()) return;
     FX?.setSilent(true);
     try {
       await refreshSystemStatsQuiet();
@@ -898,12 +909,13 @@ function setupPolling() {
   clearInterval(pollTimer);
   let pollBusy = false;
   pollTimer = setInterval(() => {
-    if (pollBusy) return;
+    if (pollBusy || FX?.isBusy?.()) return;
     pollBusy = true;
     (async () => {
       try {
         FX?.setSilent(true);
         await checkReady();
+        if (FX?.isBusy?.()) return;
         if (['home', 'works'].includes(currentPage)) await loadTasksAndRender(true);
         if (['avatars', 'create'].includes(currentPage)) await pollAvatarPagesQuiet();
       } finally {
@@ -1022,7 +1034,8 @@ async function checkReady() {
 
 async function loadTasksAndRender(silent = false) {
   const animate = !silent;
-  FX?.setSilent(silent);
+  if (silent && FX?.isBusy?.()) return;
+  if (silent) FX?.setSilent(true);
   try {
     await refreshAvatarCounts();
     try {
@@ -1038,7 +1051,7 @@ async function loadTasksAndRender(silent = false) {
       console.error(e);
     }
   } finally {
-    FX?.setSilent(false);
+    if (silent) FX?.setSilent(false);
   }
 }
 
@@ -1170,35 +1183,43 @@ function syncWorkSelection() {
 }
 
 async function renderWorks({ animate = true } = {}) {
-  const userQ = ($('#workUserSearch')?.value || '').trim();
-  const data = await fetchWorksPage();
-  const grid = $('#worksGrid');
-  const toolbar = $('#worksToolbar');
-  if (!data) return;
-  const items = worksPageItems;
-  const { page, pages, total } = worksPageMeta;
-  if (!items.length) {
-    toolbar?.classList.add('hidden');
-    const emptyMsg = userQ
-      ? `<div class="empty-state"><div class="ico">📽</div><h3>该用户暂无作品</h3><p>用户标识「${esc(userQ)}」下没有匹配的任务</p></div>`
-      : `<div class="empty-state"><div class="ico">📽</div><h3>暂无作品</h3><p>去「创建」页开始第一个合成吧</p></div>`;
-    if (!grid.querySelector('.empty-state') || grid.querySelector('[data-task-id]')) {
-      await paintGrid(grid, emptyMsg, animate);
+  if (!animate && FX?.isBusy?.()) return;
+  const seq = ++gridPaintSeq.works;
+  beginUserGridPaint(animate);
+  try {
+    const userQ = ($('#workUserSearch')?.value || '').trim();
+    const data = await fetchWorksPage();
+    if (seq !== gridPaintSeq.works) return;
+    const grid = $('#worksGrid');
+    const toolbar = $('#worksToolbar');
+    if (!data) return;
+    const items = worksPageItems;
+    const { page, pages, total } = worksPageMeta;
+    if (!items.length) {
+      toolbar?.classList.add('hidden');
+      const emptyMsg = userQ
+        ? `<div class="empty-state"><div class="ico">📽</div><h3>该用户暂无作品</h3><p>用户标识「${esc(userQ)}」下没有匹配的任务</p></div>`
+        : `<div class="empty-state"><div class="ico">📽</div><h3>暂无作品</h3><p>去「创建」页开始第一个合成吧</p></div>`;
+      if (!grid.querySelector('.empty-state') || grid.querySelector('[data-task-id]')) {
+        await paintGrid(grid, emptyMsg, animate);
+      }
+      renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
+      return;
+    }
+    toolbar?.classList.remove('hidden');
+    if (canPatchTaskCards(grid, items)) {
+      [...grid.querySelectorAll('.work-card[data-task-id]')].forEach((card, i) => {
+        patchWorkCard(card, items[i]);
+      });
+    } else {
+      const html = items.map((t) => renderWorkCard(t, { selectable: true, selected: selectedWorkIds.has(t.task_id) })).join('');
+      await paintGrid(grid, html, animate);
     }
     renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
-    return;
+    updateWorksToolbar(items);
+  } finally {
+    endUserGridPaint(animate);
   }
-  toolbar?.classList.remove('hidden');
-  if (canPatchTaskCards(grid, items)) {
-    [...grid.querySelectorAll('.work-card[data-task-id]')].forEach((card, i) => {
-      patchWorkCard(card, items[i]);
-    });
-  } else {
-    const html = items.map((t) => renderWorkCard(t, { selectable: true, selected: selectedWorkIds.has(t.task_id) })).join('');
-    await paintGrid(grid, html, animate);
-  }
-  renderPager($('#worksPager'), page, pages, total, PAGE_SIZE.works);
-  updateWorksToolbar(items);
 }
 
 async function batchDeleteWorks() {
@@ -1411,36 +1432,44 @@ function renderAvatarCard(a, opts = {}) {
 async function renderCreateAvatars({ animate = true } = {}) {
   const grid = $('#createAvatarGrid');
   if (!grid) return;
-  const privQ = ($('#createPrivateSearch')?.value || '').trim();
-  const filterWrap = $('#createPrivateFilterWrap');
-  const hint = $('#createPrivateHint');
-  await refreshAvatarCounts();
-  if ($('#createAvatarTabPublicCount')) $('#createAvatarTabPublicCount').textContent = String(avatarReadyCounts.public);
-  if ($('#createAvatarTabPrivateCount')) $('#createAvatarTabPrivateCount').textContent = String(avatarReadyCounts.private);
-  $$('#createAvatarTypeTabs [data-avatar-tab]').forEach((btn) => btn.classList.toggle('active', btn.dataset.avatarTab === avatarTab));
-  filterWrap?.classList.toggle('hidden', avatarTab !== 'private');
-  if (hint) hint.classList.toggle('hidden', avatarTab !== 'private');
+  if (!animate && FX?.isBusy?.()) return;
+  const seq = ++gridPaintSeq.create;
+  beginUserGridPaint(animate);
+  try {
+    const privQ = ($('#createPrivateSearch')?.value || '').trim();
+    const filterWrap = $('#createPrivateFilterWrap');
+    const hint = $('#createPrivateHint');
+    await refreshAvatarCounts();
+    if ($('#createAvatarTabPublicCount')) $('#createAvatarTabPublicCount').textContent = String(avatarReadyCounts.public);
+    if ($('#createAvatarTabPrivateCount')) $('#createAvatarTabPrivateCount').textContent = String(avatarReadyCounts.private);
+    $$('#createAvatarTypeTabs [data-avatar-tab]').forEach((btn) => btn.classList.toggle('active', btn.dataset.avatarTab === avatarTab));
+    filterWrap?.classList.toggle('hidden', avatarTab !== 'private');
+    if (hint) hint.classList.toggle('hidden', avatarTab !== 'private');
 
-  const data = await fetchAvatarsPage(undefined, { username: privQ, bake_status: 'ready' });
-  if (!data) return;
-  const items = data.items || [];
-  const { page, pages, total } = avatarsPageMeta;
+    const data = await fetchAvatarsPage(undefined, { username: privQ, bake_status: 'ready' });
+    if (seq !== gridPaintSeq.create) return;
+    if (!data) return;
+    const items = data.items || [];
+    const { page, pages, total } = avatarsPageMeta;
 
-  if (canPatchAvatarGrid(grid, items) && items.length) {
-    patchAvatarGridCards(grid, items, { pickMode: true });
-  } else if (avatarTab === 'public') {
-    const html = items.length
-      ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
-      : '<div class="empty-state inline"><p>暂无可用公共形象，请先在形象库上传并完成转码</p></div>';
-    await paintGrid(grid, html, animate);
-  } else {
-    const html = items.length
-      ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
-      : `<div class="empty-state inline"><p>${privQ ? '该用户暂无可用个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
-    await paintGrid(grid, html, animate);
+    if (canPatchAvatarGrid(grid, items) && items.length) {
+      patchAvatarGridCards(grid, items, { pickMode: true });
+    } else if (avatarTab === 'public') {
+      const html = items.length
+        ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
+        : '<div class="empty-state inline"><p>暂无可用公共形象，请先在形象库上传并完成转码</p></div>';
+      await paintGrid(grid, html, animate);
+    } else {
+      const html = items.length
+        ? items.map((a) => renderAvatarCard(a, { pickMode: true })).join('')
+        : `<div class="empty-state inline"><p>${privQ ? '该用户暂无可用个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
+      await paintGrid(grid, html, animate);
+    }
+    renderPager($('#createAvatarPager'), page, pages, total, PAGE_SIZE.avatars);
+    syncAvatarsUploadPanelHeight();
+  } finally {
+    endUserGridPaint(animate);
   }
-  renderPager($('#createAvatarPager'), page, pages, total, PAGE_SIZE.avatars);
-  syncAvatarsUploadPanelHeight();
 }
 
 function pickAvatarFromCard(id, video, thumb) {
@@ -1469,37 +1498,45 @@ function syncAvatarsUploadPanelHeight() {
 async function renderAvatars({ animate = true } = {}) {
   const grid = $('#avatarGrid');
   if (!grid) return;
-  const privQ = ($('#avatarPrivateSearch')?.value || '').trim();
-  const filterWrap = $('#avatarPrivateFilterWrap');
-  const hint = $('#avatarPrivateHint');
-  await refreshAvatarCounts();
-  if ($('#avatarTabPublicCount')) $('#avatarTabPublicCount').textContent = String(avatarCounts.public);
-  if ($('#avatarTabPrivateCount')) $('#avatarTabPrivateCount').textContent = String(avatarCounts.private);
-  $$('#avatarTypeTabs [data-avatar-tab]').forEach((btn) => btn.classList.toggle('active', btn.dataset.avatarTab === avatarTab));
-  filterWrap?.classList.toggle('hidden', avatarTab !== 'private');
-  if (hint) hint.classList.toggle('hidden', avatarTab !== 'private');
+  if (!animate && FX?.isBusy?.()) return;
+  const seq = ++gridPaintSeq.avatars;
+  beginUserGridPaint(animate);
+  try {
+    const privQ = ($('#avatarPrivateSearch')?.value || '').trim();
+    const filterWrap = $('#avatarPrivateFilterWrap');
+    const hint = $('#avatarPrivateHint');
+    await refreshAvatarCounts();
+    if ($('#avatarTabPublicCount')) $('#avatarTabPublicCount').textContent = String(avatarCounts.public);
+    if ($('#avatarTabPrivateCount')) $('#avatarTabPrivateCount').textContent = String(avatarCounts.private);
+    $$('#avatarTypeTabs [data-avatar-tab]').forEach((btn) => btn.classList.toggle('active', btn.dataset.avatarTab === avatarTab));
+    filterWrap?.classList.toggle('hidden', avatarTab !== 'private');
+    if (hint) hint.classList.toggle('hidden', avatarTab !== 'private');
 
-  const data = await fetchAvatarsPage(undefined, { username: privQ });
-  if (!data) return;
-  const items = data.items || [];
-  const { page, pages, total } = avatarsPageMeta;
+    const data = await fetchAvatarsPage(undefined, { username: privQ });
+    if (seq !== gridPaintSeq.avatars) return;
+    if (!data) return;
+    const items = data.items || [];
+    const { page, pages, total } = avatarsPageMeta;
 
-  if (canPatchAvatarGrid(grid, items) && items.length) {
-    patchAvatarGridCards(grid, items);
-  } else if (avatarTab === 'public') {
-    const html = items.length
-      ? items.map((a) => renderAvatarCard(a)).join('')
-      : '<div class="empty-state inline"><p>暂无公共形象，点击「上传形象」</p></div>';
-    await paintGrid(grid, html, animate);
-  } else {
-    const html = items.length
-      ? items.map((a) => renderAvatarCard(a)).join('')
-      : `<div class="empty-state inline"><p>${privQ ? '未找到该用户的个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
-    await paintGrid(grid, html, animate);
+    if (canPatchAvatarGrid(grid, items) && items.length) {
+      patchAvatarGridCards(grid, items);
+    } else if (avatarTab === 'public') {
+      const html = items.length
+        ? items.map((a) => renderAvatarCard(a)).join('')
+        : '<div class="empty-state inline"><p>暂无公共形象，点击「上传形象」</p></div>';
+      await paintGrid(grid, html, animate);
+    } else {
+      const html = items.length
+        ? items.map((a) => renderAvatarCard(a)).join('')
+        : `<div class="empty-state inline"><p>${privQ ? '未找到该用户的个人形象' : '请输入用户ID查看个人形象'}</p></div>`;
+      await paintGrid(grid, html, animate);
+    }
+    renderPager($('#avatarPager'), page, pages, total, PAGE_SIZE.avatars);
+    syncAvatarsUploadPanelHeight();
+    scheduleBakePoll();
+  } finally {
+    endUserGridPaint(animate);
   }
-  renderPager($('#avatarPager'), page, pages, total, PAGE_SIZE.avatars);
-  syncAvatarsUploadPanelHeight();
-  scheduleBakePoll();
 }
 
 function renderAvatarPicker() {
