@@ -1,8 +1,11 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+import shutil
+import time
 
 from . import avatars
-from .config import DEFAULT_STEPS, STORAGE
+from .config import DEFAULT_STEPS, STORAGE, job_ttl_days
 from .progress import enrich_jobs, format_seconds
 
 CANCEL_MESSAGE = "已取消"
@@ -80,6 +83,10 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
     else:
         remaining = 0 if status in {"done", "error", "cancelled"} else job.get("remaining_seconds")
         remain = None
+    queue_position = job.get("queue_position") if status == "wait" else None
+    queue_ahead = None
+    if status == "wait" and queue_position is not None:
+        queue_ahead = max(0, int(queue_position) - 1)
     return {
         "task_id": tid,
         "task_name": job.get("task_name") or job.get("audio_name") or tid,
@@ -111,6 +118,8 @@ def to_admin_task(job: dict, char: Optional[dict] = None) -> dict:
         "audio_duration": job.get("audio_duration"),
         "remaining_seconds": remaining,
         "total_duration_text": remain,
+        "queue_position": queue_position,
+        "queue_ahead": queue_ahead,
     }
 
 
@@ -156,8 +165,23 @@ def filter_jobs(
 ) -> list[dict]:
     items = jobs
     if username:
-        key = username.strip()
-        items = [j for j in items if (j.get("username") or "") == key]
+        try:
+            key = avatars.normalize_user_id(username)
+        except ValueError:
+            key = username.strip() or None
+        if key:
+            matched = []
+            for j in items:
+                stored = j.get("username") or ""
+                try:
+                    got = avatars.normalize_user_id(stored)
+                except ValueError:
+                    got = stored.strip() or None
+                if got == key:
+                    matched.append(j)
+            items = matched
+        else:
+            items = []
     elif not include_private:
         items = [j for j in items if (j.get("character_type") or "public") != "private"]
     if status and status != "all":
@@ -193,3 +217,154 @@ def can_view_job(job: dict, owner: Optional[str], *, admin: bool = False) -> boo
     if owner and (job.get("character_user_id") or "") == owner:
         return True
     return False
+
+
+def personal_summary(conn, owner: str) -> dict:
+    """This user's avatars, works, and global queue wait ahead of their earliest queued job."""
+    key = avatars.normalize_user_id(owner)
+    avatars_total = avatars_ready = avatars_processing = avatars_error = 0
+    if key:
+        for row in conn.execute(
+            """
+            SELECT status FROM characters
+            WHERE COALESCE(type, 'public') = 'private' AND user_id = ?
+            """,
+            (key,),
+        ):
+            avatars_total += 1
+            st = row["status"] or ""
+            if st == "ready":
+                avatars_ready += 1
+            elif st in {"queued", "preparing", "aligning"}:
+                avatars_processing += 1
+            elif st == "failed":
+                avatars_error += 1
+    jobs = filter_jobs(load_jobs(conn), username=key, include_private=True) if key else []
+    done = run = wait = error = cancelled = 0
+    first_pos = None
+    for job in jobs:
+        st = job.get("status")
+        if st == "done":
+            done += 1
+        elif st == "running":
+            run += 1
+        elif st == "queued":
+            wait += 1
+            pos = job.get("queue_position")
+            if pos is not None and (first_pos is None or int(pos) < first_pos):
+                first_pos = int(pos)
+        elif st == "failed":
+            error += 1
+        elif st == "cancelled":
+            cancelled += 1
+    gpu_busy = False
+    try:
+        from .gpu_runtime import inference_running
+
+        gpu_busy = bool(inference_running())
+    except Exception:
+        pass
+    return {
+        "avatars": {
+            "total": avatars_total,
+            "ready": avatars_ready,
+            "processing": avatars_processing,
+            "error": avatars_error,
+        },
+        "tasks": {
+            "done": done,
+            "run": run,
+            "wait": wait,
+            "error": error,
+            "cancelled": cancelled,
+        },
+        "queue": {
+            "mine": wait,
+            "ahead": None if first_pos is None else max(0, first_pos - 1),
+            "position": first_pos,
+            "gpu_busy": gpu_busy,
+        },
+    }
+
+
+_PURGE_MIN_INTERVAL = 60
+_last_job_purge_at = 0.0
+
+
+def _job_keep_stamp(job: dict) -> str:
+    stamps = [
+        job.get("finished_at"),
+        job.get("progress_updated_at"),
+        job.get("started_at"),
+        job.get("created_at"),
+    ]
+    kept = [s for s in stamps if s]
+    return max(kept) if kept else ""
+
+
+def remove_job_files(job_id: str) -> None:
+    shutil.rmtree(job_dir(job_id), ignore_errors=True)
+
+
+def purge_expired_jobs(*, force: bool = False) -> int:
+    """Drop works older than job_ttl_days. Never touches a running synthesis."""
+    global _last_job_purge_at
+    now = time.time()
+    if not force and now - _last_job_purge_at < _PURGE_MIN_INTERVAL:
+        return 0
+    _last_job_purge_at = now
+    days = job_ttl_days()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    live: set[str] = set()
+    try:
+        from .gpu_runtime import inference_pids, job_id_from_pid
+
+        for pid in inference_pids():
+            jid = job_id_from_pid(pid)
+            if jid:
+                live.add(jid)
+    except Exception:
+        pass
+    from . import db
+
+    removed = 0
+    with db.db() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, status, created_at, started_at, finished_at, progress_updated_at
+            FROM jobs WHERE status != ?
+            """,
+            ("running",),
+        ).fetchall()
+        expired = []
+        for row in rows:
+            item = dict(row)
+            if item["id"] in live:
+                continue
+            stamp = _job_keep_stamp(item)
+            if stamp and stamp < cutoff:
+                expired.append(item["id"])
+        for jid in expired:
+            cur = conn.execute("DELETE FROM jobs WHERE id = ? AND status != ?", (jid, "running"))
+            if cur.rowcount:
+                remove_job_files(jid)
+                removed += 1
+    root = STORAGE / "jobs"
+    if root.is_dir():
+        with db.db() as conn:
+            known = {row["id"] for row in conn.execute("SELECT id FROM jobs")}
+        ttl_sec = days * 86400
+        for path in list(root.iterdir()):
+            if not path.is_dir() or path.name in known or path.name in live:
+                continue
+            try:
+                age = now - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < ttl_sec:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        print(f"purged {removed} expired jobs (>{days}d)", flush=True)
+    return removed

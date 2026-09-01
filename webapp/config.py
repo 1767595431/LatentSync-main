@@ -32,6 +32,7 @@ UNET_CKPT = ROOT / "checkpoints" / "latentsync_unet.pt"
 
 ADMIN_COOKIE = "qemix_gate"
 SESSION_IDLE_SECONDS = 30 * 60
+JOB_TTL_DAYS = 15
 
 
 def load_yaml() -> Dict[str, Any]:
@@ -83,6 +84,15 @@ def load_gpus() -> List[int]:
         seen.add(gid)
         ids.append(gid)
     return ids or [0]
+
+
+def job_ttl_days() -> int:
+    raw = load_yaml().get("job_ttl_days", JOB_TTL_DAYS)
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return JOB_TTL_DAYS
+    return days if days > 0 else JOB_TTL_DAYS
 
 
 def ensure_dirs() -> None:

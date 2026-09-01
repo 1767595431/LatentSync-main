@@ -67,6 +67,7 @@ async def lifespan(_: FastAPI):
     ensure_dirs()
     db.init_db()
     avatars.purge_stale_uploads(force=True)
+    tasks.purge_expired_jobs(force=True)
     yield
 
 
@@ -1009,10 +1010,10 @@ def _requeue_job(job: dict) -> None:
             SET status = ?, error = NULL, progress = ?, output_path = NULL, preview_path = NULL,
                 started_at = NULL, finished_at = NULL, stage = ?, progress_percent = 0,
                 remaining_seconds = ?, estimated_seconds = ?, current_chunk = NULL,
-                infer_started_at = NULL, tqdm_remaining = NULL
+                infer_started_at = NULL, tqdm_remaining = NULL, progress_updated_at = ?
             WHERE id = ? AND status != ?
             """,
-            ("queued", "排队中", "queued", estimated, estimated, job["id"], "running"),
+            ("queued", "排队中", "queued", estimated, estimated, db.utcnow(), job["id"], "running"),
         )
         if not updated.rowcount:
             raise HTTPException(400, "正在合成的任务不能重试")
@@ -1089,7 +1090,7 @@ def delete_job(
         if row["status"] == "running":
             raise HTTPException(400, "正在合成的任务不能删除")
         conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
-    shutil.rmtree(STORAGE / "jobs" / job_id, ignore_errors=True)
+    tasks.remove_job_files(job_id)
     return {"ok": True}
 
 
@@ -1172,6 +1173,23 @@ def system_status(request: Request):
     )
 
 
+@app.get("/api/summary")
+def personal_summary(
+    request: Request,
+    username: Optional[str] = None,
+    user_id: Optional[str] = None,
+):
+    try:
+        owner = _owner_of(user_id, username)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "用户ID无效")
+    if not owner:
+        return fail("请填写用户ID")
+    with db.db() as conn:
+        data = tasks.personal_summary(conn, owner)
+    return ok(data)
+
+
 @app.get("/api/tasks")
 def list_tasks(
     request: Request,
@@ -1182,17 +1200,23 @@ def list_tasks(
     status: Optional[str] = None,
     keyword: Optional[str] = None,
 ):
-    items = _admin_tasks(request, username or user_id, status, keyword)
+    try:
+        owner = _owner_of(user_id, username)
+    except HTTPException as exc:
+        return fail(exc.detail if isinstance(exc.detail, str) else "用户ID无效")
+    items = _admin_tasks(request, owner, status, keyword)
     page_data = avatars.paginate(items, page, page_size)
-    return ok(
-        {
-            "tasks": page_data["items"],
-            "total": page_data["total"],
-            "page": page_data["page"],
-            "pages": page_data["pages"],
-            "page_size": page_data["page_size"],
-        }
-    )
+    payload = {
+        "tasks": page_data["items"],
+        "total": page_data["total"],
+        "page": page_data["page"],
+        "pages": page_data["pages"],
+        "page_size": page_data["page_size"],
+    }
+    if owner:
+        with db.db() as conn:
+            payload["summary"] = tasks.personal_summary(conn, owner)
+    return ok(payload)
 
 
 @app.post("/api/tasks/create")
@@ -1205,7 +1229,10 @@ async def create_task(
     steps: int = Form(DEFAULT_STEPS, title="合成质量步数"),
 ):
     name = (task_name or "").strip()
-    owner = (username or "").strip()
+    try:
+        owner = avatars.normalize_user_id(username)
+    except ValueError as exc:
+        return fail(str(exc))
     if not name:
         return fail("请填写作品名称")
     if not owner:
@@ -1398,7 +1425,7 @@ def delete_task(
         if row["status"] == "running":
             return fail("正在合成的任务不能删除")
         conn.execute("DELETE FROM jobs WHERE id = ?", (task_id,))
-    shutil.rmtree(STORAGE / "jobs" / task_id, ignore_errors=True)
+    tasks.remove_job_files(task_id)
     return ok({"task_id": task_id}, "已删除")
 
 
@@ -1603,6 +1630,7 @@ _CN_DOCS = {
     ("GET", "/api/jobs/{job_id}/download"): ("下载成片", "作品"),
     ("POST", "/api/jobs/{job_id}/retry"): ("重试合成任务", "作品"),
     ("POST", "/api/jobs/{job_id}/cancel"): ("取消合成任务", "作品"),
+    ("GET", "/api/summary"): ("查询个人形象与作品统计", "系统"),
     ("GET", "/api/tasks"): ("分页列出作品", "作品"),
     ("POST", "/api/tasks/create"): ("创建合成作品", "作品"),
     ("GET", "/api/tasks/{task_id}"): ("查询作品", "作品"),

@@ -1,7 +1,6 @@
 import fcntl
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -34,7 +33,13 @@ from .gpu_runtime import (
     job_id_from_pid,
     write_status,
 )
-from .media import ensure_preview as write_preview_mp4, ffmpeg_preview_video, preview_is_current
+from .media import (
+    ensure_preview as write_preview_mp4,
+    ffmpeg_preview_video,
+    has_av_streams,
+    mux_video_audio,
+    preview_is_current,
+)
 from .progress import parse_job_line
 
 _stop = threading.Event()
@@ -226,7 +231,7 @@ def _watch_adopted(pid: int, gpu_id: int, job_id: Optional[str]) -> None:
         if tasks.is_cancel_requested(job_id):
             _mark_job_cancelled(job_id)
             return
-        if output_path.exists() and output_path.stat().st_size >= 1000:
+        if _finalize_job_output(job_id, output_path):
             _mark_job_done(job_id, output_path, only_if_running=True)
         else:
             with db.db() as conn:
@@ -602,6 +607,7 @@ def _loop() -> None:
             from .avatars import purge_stale_uploads
 
             purge_stale_uploads()
+            tasks.purge_expired_jobs()
         except Exception:
             pass
         time.sleep(1)
@@ -762,13 +768,13 @@ def _execute_job(job: dict, gpu_id: int) -> None:
     job_dir.mkdir(parents=True, exist_ok=True)
     output_path = job_dir / "output.mp4"
     temp_dir = job_dir / "temp"
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
     if tasks.is_cancel_requested(job_id):
         _mark_job_cancelled(job_id)
         _release_gpu(gpu_id)
         return
+
+    _archive_job_temp(temp_dir)
 
     cmd = [
         PYTHON,
@@ -815,7 +821,7 @@ def _execute_job(job: dict, gpu_id: int) -> None:
         code = _drain_inference_log(proc, log_path, start_off, job)
         if tasks.is_cancel_requested(job_id):
             raise JobCancelled()
-        if code != 0 or not output_path.exists() or output_path.stat().st_size < 1000:
+        if not _finalize_job_output(job_id, output_path):
             raise RuntimeError(f"合成失败，退出码 {code}")
         _mark_job_done(job_id, output_path)
     except JobCancelled:
@@ -834,8 +840,51 @@ def _execute_job(job: dict, gpu_id: int) -> None:
                     ("failed", str(exc), db.utcnow(), "failed", job_id, "running"),
                 )
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
         _release_gpu(gpu_id)
+
+
+def _archive_job_temp(temp_dir: Path) -> None:
+    """Move leftover temp aside. Never delete it; only task delete removes job files."""
+    if not temp_dir.exists():
+        return
+    try:
+        nonempty = any(temp_dir.iterdir())
+    except OSError:
+        nonempty = True
+    if not nonempty:
+        return
+    stamp = db.utcnow().replace(":", "").replace("-", "")
+    dest = temp_dir.with_name(f"temp.keep.{stamp}")
+    n = 0
+    while dest.exists():
+        n += 1
+        dest = temp_dir.with_name(f"temp.keep.{stamp}.{n}")
+    temp_dir.rename(dest)
+    print(f"kept previous temp as {dest}", flush=True)
+
+
+def _finalize_job_output(job_id: str, output_path: Path) -> bool:
+    """Accept a playable MP4, or remux temp/video.mp4 + audio if ffmpeg crashed after 100%."""
+    if has_av_streams(output_path, need_audio=True):
+        return True
+    if output_path.exists():
+        output_path.unlink(missing_ok=True)
+    job_dir = STORAGE / "jobs" / job_id
+    video = job_dir / "temp" / "video.mp4"
+    audio = job_dir / "temp" / "audio.wav"
+    if not audio.exists():
+        fallback = job_dir / "audio.wav"
+        if fallback.exists():
+            audio = fallback
+    if not video.exists() or video.stat().st_size < 1000 or not audio.exists():
+        return False
+    try:
+        print(f"Job {job_id} remuxing temp video after inference exit", flush=True)
+        mux_video_audio(video, audio, output_path)
+    except Exception as exc:
+        print(f"Job {job_id} remux failed: {exc}", flush=True)
+        return False
+    return has_av_streams(output_path, need_audio=True)
 
 
 def _update_job_progress(job_id: str, fields: dict) -> None:

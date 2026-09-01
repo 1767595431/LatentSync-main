@@ -2,7 +2,7 @@
 const API = window.APP_BASE || '';
 const PAGES = {
   home: { title: '工作台', desc: '最新作品与运行状态一览' },
-  works: { title: '作品库', desc: '形象 → 成品的完整合成记录' },
+  works: { title: '作品库', desc: '形象 → 成品的完整合成记录，满 15 天自动清理' },
   avatars: { title: '形象库', desc: '数字人模板视频管理' },
   create: { title: '创建作品', desc: '选择形象，上传音频，一键合成' },
   settings: { title: '设置', desc: '服务状态与访问会话' },

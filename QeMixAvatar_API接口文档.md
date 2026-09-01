@@ -86,7 +86,7 @@ http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public
 
 | 场景 | 怎么传 |
 |---|---|
-| 查询、删除、重试、取消、重新转码 | Query：`username` 或 `user_id`，二选一 |
+| 查询、删除、重试、取消、重新转码、个人统计 | Query：`username` 或 `user_id`，二选一 |
 | 创建作品 | Form 字段名固定为 `username`（必填，公共形象也要填） |
 | 读取个人封面 / 形象视频 / 个人成片 | 请求头 `X-User-Id` 或 `X-Username`，必须与所有者一致 |
 
@@ -166,15 +166,20 @@ X-User-Id: u1001
 
 `<img src>` / `<video src>` **无法自定义请求头**。对接个人库时，请由你们的服务端带 `X-User-Id` 拉取后再转发给自己的前端，或拉成 blob 再播放。不要把个人媒体地址直接给最终用户当可分享链接。
 
+### 1.9 作品保留期
+
+作品自创建或最后一次完成/重试起保留 **15 天**。到期后**整条任务删除**：列表记录、成片、音频、临时文件一并清掉，不可恢复。正在合成的任务不会删。需要长期保存请自行下载。
+
 ---
 
 ## 2. 推荐对接流程
 
-1. `GET /api/avatars?type=public` 选用公共形象，或按 4.2 上传个人形象（多个视频可并行，见 4.2）。
-2. 个人形象上传后轮询列表，直到该条 `bake_status=ready`。
-3. `POST /api/tasks/create` 提交音频，拿到 `task_id`。
-4. `GET /api/tasks/{task_id}?username=<用户ID>` 轮询，直到 `status=done`、`error` 或 `cancelled`。排队或合成中可 `POST /api/tasks/{task_id}/cancel` 取消；成功后该条即为 `cancelled`（不是 `error`），队列里下一条会自动开始，不必为取消再轮询。
-5. `status=done` 后：预览用 `result_path`（低码率），保存原片用 `GET /api/tasks/{task_id}/download`。个人成片两次请求都要带 `X-User-Id`。
+1. 个人端进入后先 `GET /api/summary?username=<用户ID>`，拿形象数、作品完成/进行中/排队，以及自己前面还有多少在排队。
+2. `GET /api/avatars?type=public` 选用公共形象，或按 4.2 上传个人形象（多个视频可并行，见 4.2）。
+3. 个人形象上传后轮询列表，直到该条 `bake_status=ready`。
+4. `POST /api/tasks/create` 提交音频，拿到 `task_id`；若 `status=wait`，用返回的 `queue_ahead` 显示前面还有几条。
+5. `GET /api/tasks/{task_id}?username=<用户ID>` 轮询，直到 `status=done`、`error` 或 `cancelled`。排队或合成中可 `POST /api/tasks/{task_id}/cancel` 取消；成功后该条即为 `cancelled`（不是 `error`），队列里下一条会自动开始，不必为取消再轮询。
+6. `status=done` 后：预览用 `result_path`（低码率），保存原片用 `GET /api/tasks/{task_id}/download`。个人成片两次请求都要带 `X-User-Id`。15 天内请下载需要留存的成片。
 
 ---
 
@@ -183,6 +188,7 @@ X-User-Id: u1001
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/system/ready` | 检查服务是否可调用（连通性） |
+| GET | `/api/summary` | 查询某用户的形象数、作品数，以及自己前面还有多少在排队 |
 | GET | `/api/avatars` | 分页列出形象 |
 | POST | `/api/avatars/upload` | 分片上传形象（init / chunk / complete / abort；多文件并行即批量） |
 | POST | `/api/avatars/{identifier}/rebake` | 转码失败后重新转码 |
@@ -211,6 +217,52 @@ curl -s http://36.136.54.165:8888/QeMixAvatar/api/system/ready
 ```
 
 成功时 `data` 含 `ready`、`checks.ffmpeg` / `checks.model` / `checks.gpu`、`gpu_busy`、`worker_alive`。浏览器跨域已允许；带 `X-User-Id` 的预检 `OPTIONS` 也会放行。
+
+---
+
+### 3.2 查询个人统计与排队位置
+
+`GET /api/summary`
+
+个人端首页请用这个。**必须传 `username` 或 `user_id`**，只统计该用户自己的个人形象和作品。排队位置按**全站合成队列**计算：GPU 同时只跑一条，所以要知道自己前面还有多少条别人的排队。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `username` 或 `user_id` | string | 是 | 用户 ID |
+
+成功 `data`：
+
+```json
+{
+  "avatars": { "total": 3, "ready": 2, "processing": 1, "error": 0 },
+  "tasks": { "done": 5, "run": 1, "wait": 2, "error": 0, "cancelled": 0 },
+  "queue": { "mine": 2, "ahead": 3, "position": 4, "gpu_busy": true }
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `avatars.total` | 该用户个人形象总数 |
+| `avatars.ready` | 已转码完成、可用来合成 |
+| `avatars.processing` | 正在转码 |
+| `avatars.error` | 转码失败 |
+| `tasks.done` | 该用户已完成作品数 |
+| `tasks.run` | 该用户正在合成的作品数 |
+| `tasks.wait` | 该用户排队中的作品数 |
+| `tasks.error` | 该用户合成失败数 |
+| `tasks.cancelled` | 该用户已取消数 |
+| `queue.mine` | 同 `tasks.wait`，该用户自己有几条在排队 |
+| `queue.ahead` | 该用户**最早一条排队作品**前面还有多少条全站排队（不含正在 GPU 上跑的那条）。`0` 表示排第一，当前条跑完就轮到自己。没有排队作品时为 `null` |
+| `queue.position` | 该用户最早一条排队作品在全站队列中的位置，从 `1` 起。没有排队作品时为 `null` |
+| `queue.gpu_busy` | 当前是否有任务正在 GPU 上合成。`ahead` 为 `0` 且 `gpu_busy` 为 `true` 时，表示自己排第一，等当前这条跑完就会开始 |
+
+```bash
+curl -s "http://36.136.54.165:8888/QeMixAvatar/api/summary?username=u1001"
+```
+
+未传用户 ID 时 `msg` 为 `请填写用户ID`。
+
+列出作品 `GET /api/tasks?username=...` 的 `data.summary` 与本接口相同，轮询作品列表时不必再调一次。
 
 ---
 
@@ -592,9 +644,13 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `audio_duration` | number | 音频时长（秒） |
 | `remaining_seconds` | number | 仅 `status=run` 时为预计剩余秒数；排队中为 `null` |
 | `total_duration_text` | string | 仅合成中给出剩余时间文案，如「约 12 分钟」；排队中为空 |
+| `queue_position` | int / null | 仅 `status=wait`：该作品在全站队列中的位置，从 `1` 起 |
+| `queue_ahead` | int / null | 仅 `status=wait`：这条作品前面还有多少条在排队（`queue_position - 1`）。`0` 表示下一条就轮到它 |
 | `created_at` / `started_at` / `finished_at` | string | 时间 |
 
 原片地址固定为 `/api/tasks/{task_id}/download`，不在 JSON 里单独给出。
+
+作品自创建或最后一次完成/重试起保留 **15 天**。到期后整条作品会被删除：**列表里的记录、成片、音频、临时文件一并清掉**，不可恢复。正在合成的任务不会删。请及时下载需要长期保存的成片。
 
 ### 6.1 分页列出作品
 
@@ -618,11 +674,18 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
   "total": 1,
   "page": 1,
   "pages": 1,
-  "page_size": 12
+  "page_size": 12,
+  "summary": {
+    "avatars": { "total": 3, "ready": 2, "processing": 1, "error": 0 },
+    "tasks": { "done": 5, "run": 1, "wait": 2, "error": 0, "cancelled": 0 },
+    "queue": { "mine": 2, "ahead": 3, "position": 4, "gpu_busy": true }
+  }
 }
 ```
 
-`tasks` 元素为完整作品对象。
+`tasks` 元素为完整作品对象。传了 `username` / `user_id` 时带 `summary`，字段与 [3.2](#32-查询个人统计与排队位置) 相同，不受当前页 `status` / `keyword` 筛选影响。未传用户 ID 时没有 `summary`。
+
+排队中的作品对象会带 `queue_position`、`queue_ahead`，表示**这一条**前面还有多少人在排。
 
 ```bash
 curl -s "http://36.136.54.165:8888/QeMixAvatar/api/tasks?username=u1001&status=wait&page=1"
@@ -645,7 +708,7 @@ curl -s "http://36.136.54.165:8888/QeMixAvatar/api/tasks?username=u1001&status=w
 | `audio` | file | 是 | 驱动音频 |
 | `steps` | int | 否 | 默认 `30`，仅 `30` / `50` / `80` |
 
-成功 `msg`：`已加入合成队列`，`data` 为作品对象，此时 `status` 为 `wait`。
+成功 `msg`：`已加入合成队列`，`data` 为作品对象，此时 `status` 为 `wait`，并带 `queue_position`、`queue_ahead`（这条前面还有几条在排）。
 
 | `msg` | 场景 |
 |---|---|
@@ -676,7 +739,7 @@ curl -s -X POST http://36.136.54.165:8888/QeMixAvatar/api/tasks/create \
 
 个人形象作品必须带 Query `username` 或 `user_id`，否则视为不存在。建议一律带上。
 
-成功时 `data` 为单个作品对象。请轮询 `status`、`progress`。
+成功时 `data` 为单个作品对象。请轮询 `status`、`progress`。`status=wait` 时看 `queue_ahead`：前面还有多少条全站排队。
 
 完成后 `status=done`，`result_path` 为 `/api/tasks/{task_id}/preview`。
 
@@ -778,7 +841,7 @@ curl -H "X-User-Id: u1001" -OJ \
 
 `DELETE /api/tasks/{task_id}`
 
-个人作品请带 Query `username` 或 `user_id`。合成中不能删除，请先取消。
+个人作品请带 Query `username` 或 `user_id`。合成中不能删除，请先取消。满 15 天的作品也会被服务端自动删除（记录和文件一起删）。
 
 成功 `msg`：`已删除`。
 
@@ -802,3 +865,4 @@ curl -s -X DELETE "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>?us
 5. `identifier` 与 `id`、`username` 与 `user_id`、`thumbnail` 与 `preview_thumbnail`、`video_path` 与 `preview_video_path`、`result_path` 与 `result_path_lbr` 为同一数据的别名，任意取一个即可。
 6. 相对路径拼在 Base URL 后，不要再自己加一层前缀。
 7. 批量上传请按文件并行调用 4.2，不要自行拼接多文件 multipart。中途放弃必须 `abort`；未完成的分片超过 24 小时无活动会被服务端删除。
+8. 作品只保留 15 天。到期后作品记录、成片、音频、临时文件一起删除，列表里也不会再出现。需要长期保存请自行下载。正在合成的任务不会被清掉。

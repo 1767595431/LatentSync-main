@@ -3,7 +3,7 @@
 import inspect
 import math
 import os
-import shutil
+import time
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -78,6 +78,112 @@ class _OnDemandVideoReader:
 
     def close(self):
         self.cap.release()
+
+
+def _mp4_has_av(path: str) -> bool:
+    if not os.path.isfile(path) or os.path.getsize(path) < 1000:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return False
+    kinds = {line.strip() for line in (result.stdout or "").splitlines() if line.strip()}
+    return "video" in kinds and "audio" in kinds
+
+
+def _mux_audio_video(video_path: str, audio_path: str, dst_path: str) -> None:
+    """Mux imageio video + wav. Avoid `-q:v 0 -q:a 0` — FFmpeg 8 dies with SIGFPE."""
+    os.makedirs(os.path.dirname(dst_path) or ".", exist_ok=True)
+    tmp_path = f"{dst_path}.mux.{os.getpid()}.mp4"
+    attempts = [
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-movflags",
+            "+faststart",
+            tmp_path,
+        ],
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            video_path,
+            "-i",
+            audio_path,
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            tmp_path,
+        ],
+    ]
+    last = "unknown"
+    try:
+        for cmd in attempts:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and _mp4_has_av(tmp_path):
+                os.replace(tmp_path, dst_path)
+                return
+            last = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"Muxing audio and video failed: {last}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 class LipsyncPipeline(DiffusionPipeline):
@@ -409,8 +515,14 @@ class LipsyncPipeline(DiffusionPipeline):
         whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
         audio_samples = read_audio(audio_path)
 
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+        if os.path.exists(temp_dir) and os.listdir(temp_dir):
+            keep = f"{temp_dir.rstrip(os.sep)}.keep.{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            suffix = 0
+            dest = keep
+            while os.path.exists(dest):
+                suffix += 1
+                dest = f"{keep}.{suffix}"
+            os.rename(temp_dir, dest)
         os.makedirs(temp_dir, exist_ok=True)
 
         probe = cv2.VideoCapture(video_path)
@@ -574,28 +686,8 @@ class LipsyncPipeline(DiffusionPipeline):
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
         print("Muxing audio and video...")
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-loglevel",
-                "error",
-                "-nostdin",
-                "-i",
-                output_video_path,
-                "-i",
-                os.path.join(temp_dir, "audio.wav"),
-                "-c:v",
-                "libx264",
-                "-crf",
-                "18",
-                "-c:a",
-                "aac",
-                "-q:v",
-                "0",
-                "-q:a",
-                "0",
-                video_out_path,
-            ],
-            check=True,
+        _mux_audio_video(
+            output_video_path,
+            os.path.join(temp_dir, "audio.wav"),
+            video_out_path,
         )

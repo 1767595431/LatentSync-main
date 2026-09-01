@@ -172,6 +172,10 @@ def enrich_jobs(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
             job["progress_percent"] = 100
             job["remaining_seconds"] = 0
             job["stage"] = job.get("stage") or "done"
+        elif job.get("status") == "running":
+            pct = job.get("progress_percent")
+            if pct is not None and float(pct) >= 100:
+                job["progress_percent"] = 99
         elif job.get("status") in {"failed", "cancelled"}:
             job["remaining_seconds"] = 0
         elif job.get("status") == "queued":
@@ -239,6 +243,8 @@ def parse_job_line(line: str, steps: int = 30) -> Optional[dict[str, Any]]:
         remain = parse_tqdm_time(match.group(5))
         if total > 0:
             percent = round(100.0 * current / total, 1)
+            if current >= total:
+                percent = min(percent, 96.0)
         return {
             "progress": f"合成中 {current}/{total} · {int(percent)}%",
             "progress_percent": percent,

@@ -21,6 +21,98 @@ def preview_lock_path(dst: Path) -> Path:
     return dst.with_name(dst.name + ".lock")
 
 
+def has_av_streams(path: Path, *, need_audio: bool = True) -> bool:
+    """True if the file is a playable MP4 with a video track (and audio if required)."""
+    return _has_streams(path, need_audio=need_audio)
+
+
+def mux_video_audio(video: Path, audio: Path, dst: Path) -> None:
+    """Mux silent video + wav into a playable MP4.
+
+    FFmpeg 8 SIGFPEs on LatentSync's original `-q:v 0 -q:a 0` flags. Write to a
+    temp file first so a crash cannot leave a fake output.mp4.
+    """
+    if not video.exists() or video.stat().st_size < 1000:
+        raise RuntimeError("待封装视频不存在")
+    if not audio.exists() or audio.stat().st_size < 100:
+        raise RuntimeError("待封装音频不存在")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.stem}.mux.{os.getpid()}.{os.urandom(4).hex()}.mp4")
+    attempts = [
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ],
+        [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "44100",
+            "-shortest",
+            "-movflags",
+            "+faststart",
+            str(tmp),
+        ],
+    ]
+    last = "unknown"
+    try:
+        for cmd in attempts:
+            tmp.unlink(missing_ok=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode == 0 and _has_streams(tmp, need_audio=True):
+                tmp.replace(dst)
+                return
+            last = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+        raise RuntimeError(f"封装成片失败: {last}")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _has_streams(path: Path, *, need_audio: bool) -> bool:
     if not path.exists() or path.stat().st_size < 1000:
         return False
