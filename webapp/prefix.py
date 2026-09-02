@@ -22,6 +22,7 @@ _MEDIA_SUFFIXES = (
     ".mkv",
     ".webm",
     ".avi",
+    ".mxf",
     ".wav",
     ".mp3",
     ".m4a",

@@ -356,6 +356,7 @@ def _release_gpu(gpu_id: int) -> None:
 
 TARGET_FPS = 25
 _FPS_TOLERANCE = 0.05
+_COPY_CODECS = {"h264", "mpeg4", "hevc", "h265"}
 
 
 def prepare_character(character_id: str) -> None:
@@ -379,7 +380,8 @@ def prepare_character(character_id: str) -> None:
     try:
         if not video_out.exists():
             src_meta = _probe(source)
-            if _is_25fps(src_meta.get("fps")):
+            already_25 = _is_25fps(src_meta.get("fps"))
+            if _can_stream_copy(src_meta):
                 with db.db() as conn:
                     conn.execute(
                         "UPDATE characters SET progress = ? WHERE id = ?",
@@ -390,9 +392,14 @@ def prepare_character(character_id: str) -> None:
                 with db.db() as conn:
                     conn.execute(
                         "UPDATE characters SET progress = ? WHERE id = ?",
-                        ("转码中", character_id),
+                        ("转码中（保持原画质）", character_id),
                     )
-                _ffmpeg_prepare_video(source, video_out)
+                _ffmpeg_prepare_video(
+                    source,
+                    video_out,
+                    restamp_fps=not already_25,
+                    deinterlace=bool(src_meta.get("interlaced")),
+                )
         if not poster_out.exists():
             _extract_poster(video_out, poster_out)
         if not preview_out.exists() or preview_out.stat().st_size < 1000:
@@ -482,6 +489,22 @@ def _is_25fps(fps: Optional[float]) -> bool:
     return fps is not None and abs(fps - TARGET_FPS) < _FPS_TOLERANCE
 
 
+def _is_high_bit_depth(pix_fmt: str) -> bool:
+    text = (pix_fmt or "").lower()
+    return any(token in text for token in ("p10", "p12", "p14", "p16", "10le", "12le", "16le"))
+
+
+def _can_stream_copy(meta: dict) -> bool:
+    """Same rule for every upload format: copy only a 25fps 8-bit H.264/HEVC stream."""
+    if not _is_25fps(meta.get("fps")):
+        return False
+    if meta.get("interlaced"):
+        return False
+    if _is_high_bit_depth(str(meta.get("pix_fmt") or "")):
+        return False
+    return str(meta.get("codec") or "").lower() in _COPY_CODECS
+
+
 def _extract_poster(src: Path, dst: Path) -> None:
     subprocess.run(
         [
@@ -522,36 +545,51 @@ def _ffmpeg_copy_silent(src: Path, dst: Path) -> None:
             check=True,
         )
     except subprocess.CalledProcessError:
-        _ffmpeg_prepare_video(src, dst)
+        _ffmpeg_prepare_video(src, dst, restamp_fps=False)
 
 
-def _ffmpeg_prepare_video(src: Path, dst: Path) -> None:
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(src),
-            "-r",
-            str(TARGET_FPS),
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-an",
-            str(dst),
-        ],
-        check=True,
-    )
+def _ffmpeg_prepare_video(
+    src: Path,
+    dst: Path,
+    *,
+    restamp_fps: bool = True,
+    deinterlace: bool = False,
+) -> None:
+    """Bake a synthesis master: same resolution, visually lossless H.264.
+
+    Preview stays 2Mbps separately. This file is what inference reads.
+    """
+    filters = []
+    if deinterlace:
+        filters.append("yadif=0:-1:0")
+    # Even size for H.264; crop 0–1 px instead of scaling the whole frame.
+    filters.append("crop=floor(iw/2)*2:floor(ih/2)*2")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+    ]
+    if restamp_fps:
+        cmd += ["-r", str(TARGET_FPS)]
+    cmd += [
+        "-vf",
+        ",".join(filters),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "slow",
+        "-crf",
+        "12",
+        "-an",
+        str(dst),
+    ]
+    subprocess.run(cmd, check=True)
 
 
 def _ffmpeg_preview_video(src: Path, dst: Path) -> None:
@@ -567,7 +605,7 @@ def _probe(path: Path) -> dict:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate,avg_frame_rate",
+            "stream=width,height,r_frame_rate,avg_frame_rate,field_order,codec_name,pix_fmt",
             "-show_entries",
             "format=duration",
             "-of",
@@ -583,11 +621,15 @@ def _probe(path: Path) -> dict:
     fmt = data.get("format") or {}
     duration = fmt.get("duration")
     fps = _fps_from_ratio(stream.get("avg_frame_rate")) or _fps_from_ratio(stream.get("r_frame_rate"))
+    field = str(stream.get("field_order") or "").strip().lower()
     return {
         "width": stream.get("width"),
         "height": stream.get("height"),
         "duration": float(duration) if duration else None,
         "fps": fps,
+        "interlaced": field in {"tt", "bb", "tb", "bt"},
+        "codec": stream.get("codec_name"),
+        "pix_fmt": stream.get("pix_fmt"),
     }
 
 

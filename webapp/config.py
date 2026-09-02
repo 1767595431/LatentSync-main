@@ -24,7 +24,7 @@ ALLOWED_STEPS = (30, 50, 80)
 DEFAULT_STEPS = 30
 GUIDANCE_SCALE = 1.5
 
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".mxf"}
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg"}
 
 UNET_CONFIG = ROOT / "configs" / "unet" / "stage2_512.yaml"

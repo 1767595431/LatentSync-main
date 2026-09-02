@@ -1692,7 +1692,7 @@ async function assertFileWithinLimit(file, kind) {
 
 /* ---- Batch avatar upload (modal + bubble, survives page switches) ---- */
 
-const VIDEO_EXTS = /\.(mp4|mov|mkv|webm|avi)$/i;
+const VIDEO_EXTS = /\.(mp4|mov|mkv|webm|avi|mxf)$/i;
 const MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024;
 const UPLOAD_CHUNK = 8 * 1024 * 1024;
 const UPLOAD_CONCURRENCY = 2;

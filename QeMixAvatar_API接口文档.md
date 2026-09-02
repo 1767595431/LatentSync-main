@@ -144,7 +144,7 @@ http://36.136.54.165:8888/QeMixAvatar/api/avatars?type=public
 
 | 种类 | 支持后缀 | 大小上限 |
 |---|---|---|
-| 形象视频 | `.mp4` `.mov` `.mkv` `.webm` `.avi` | 2GB |
+| 形象视频 | `.mp4` `.mov` `.mkv` `.webm` `.avi` `.mxf` | 2GB |
 | 驱动音频 | `.wav` `.mp3` `.m4a` `.aac` `.flac` `.ogg` | 300MB |
 
 ### 1.8 个人库隔离（媒体必须带头）
