@@ -127,13 +127,19 @@ function mediaUrl(path) {
   } catch (_) {
     /* keep raw if malformed */
   }
+  let suffix = '';
+  const cut = normalized.search(/[?#]/);
+  if (cut >= 0) {
+    suffix = normalized.slice(cut);
+    normalized = normalized.slice(0, cut);
+  }
   return normalized
     .split('/')
     .map((seg, i) => (i === 0 || seg === '' ? seg : encodeURIComponent(seg)))
-    .join('/');
+    .join('/') + suffix;
 }
 
-function posterHtml(src, alt = '', { eager = false } = {}) {
+function posterHtml(src, alt = '', { eager = true } = {}) {
   if (!src) {
     return `<div class="placeholder"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="4" width="20" height="16" rx="2"/></svg><span>暂无预览</span></div>`;
   }

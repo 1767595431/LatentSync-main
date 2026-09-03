@@ -93,12 +93,29 @@ def can_view(row: dict, owner: Optional[str], *, admin: bool = False) -> bool:
     return bool(owner) and owner == (row.get("user_id") or "")
 
 
+def _file_version(path: Optional[str]) -> str:
+    if not path:
+        return ""
+    try:
+        return str(int(Path(path).stat().st_mtime))
+    except OSError:
+        return ""
+
+
+def _poster_url(character_id: str, poster_path: Optional[str]) -> str:
+    if not poster_path:
+        return ""
+    url = f"/api/characters/{character_id}/poster"
+    ver = _file_version(poster_path)
+    return f"{url}?v={ver}" if ver else url
+
+
 def to_admin_avatar(row: dict) -> dict:
     item = public_character(row)
     cid = item["id"]
     ready = item.get("status") == "ready" and bool(item.get("video_path"))
     # Never put user_id on media URLs: a shareable query string must not unlock private bytes.
-    poster = f"/api/characters/{cid}/poster" if item.get("poster_path") else ""
+    poster = _poster_url(cid, item.get("poster_path"))
     video = f"/api/characters/{cid}/video" if ready else ""
     owner = item.get("user_id")
     return {

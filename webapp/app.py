@@ -222,13 +222,19 @@ def _send_media(
     filename: Optional[str] = None,
     *,
     private: bool = False,
+    cacheable: bool = False,
     extra_headers: Optional[dict] = None,
 ) -> FileResponse:
     headers = dict(extra_headers or {})
     if private:
-        headers["Cache-Control"] = "private, no-store"
-        headers["Pragma"] = "no-cache"
-        headers["X-Content-Type-Options"] = "nosniff"
+        headers.setdefault("X-Content-Type-Options", "nosniff")
+        if cacheable:
+            headers.setdefault("Cache-Control", "private, max-age=31536000, immutable")
+        else:
+            headers["Cache-Control"] = "private, no-store"
+            headers["Pragma"] = "no-cache"
+    elif cacheable:
+        headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
     return FileResponse(
         path,
         media_type=media_type,
@@ -516,6 +522,7 @@ def character_poster(character_id: str, request: Request):
         Path(row["poster_path"]),
         "image/jpeg",
         private=avatars.is_private(row),
+        cacheable=True,
     )
 
 

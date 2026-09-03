@@ -166,7 +166,32 @@ X-User-Id: u1001
 
 `<img src>` / `<video src>` **无法自定义请求头**。对接个人库时，请由你们的服务端带 `X-User-Id` 拉取后再转发给自己的前端，或拉成 blob 再播放。不要把个人媒体地址直接给最终用户当可分享链接。
 
-### 1.9 作品保留期
+### 1.9 封面请缓存（前端必做）
+
+形象和成品列表上的**首帧图是同一张封面 JPEG**，不是视频。字段：
+
+| JSON 字段 | 指向 |
+|---|---|
+| 形象 `thumbnail` / `preview_thumbnail` | `/api/characters/{id}/poster?v=…` |
+| 作品 `avatar_thumbnail` / `result_thumbnail` | 同上（成品封面当前就是该形象封面） |
+
+地址会带 `?v=` 版本号，例如 `/api/characters/a1b2c3d4/poster?v=1788164114`。**请整段拿去当 `img` 的 `src`（或当你们中转缓存的键），不要把 `?v=` 裁掉。** `v` 变了才是封面更新，需要重新拉；`v` 不变则应命中缓存，刷新、翻页不应再一张张加载。
+
+服务端对封面的缓存头：
+
+| 种类 | `Cache-Control` |
+|---|---|
+| 公共形象封面 | `public, max-age=31536000, immutable` |
+| 个人形象封面 | `private, max-age=31536000, immutable` |
+
+前端建议：
+
+1. 公共封面可直接 `<img src="BaseURL + thumbnail">`，让浏览器按上面的头缓存。
+2. 个人封面仍须由你们服务端带 `X-User-Id` 拉取后再给前端（见 1.8）。中转时用**含 `v` 的完整路径**做缓存键，并把 `Cache-Control` 转给浏览器。
+3. 当前页可见的封面用正常加载（不要整页 `loading=lazy`），避免列表一张张闪出来。
+4. **不要**用同一策略缓存形象预览视频、成片预览、原片下载：那些接口仍是 `no-store`，体积也大。
+
+### 1.10 作品保留期
 
 作品自创建或最后一次完成/重试起保留 **15 天**。到期后**整条任务删除**：列表记录、成片、音频、临时文件一并清掉，不可恢复。正在合成的任务不会删。需要长期保存请自行下载。
 
@@ -301,8 +326,8 @@ curl -s "http://36.136.54.165:8888/QeMixAvatar/api/summary?username=u1001"
       "width": 1920,
       "height": 1080,
       "created_at": "2026-08-30T01:20:00Z",
-      "thumbnail": "/api/characters/a1b2c3d4/poster",
-      "preview_thumbnail": "/api/characters/a1b2c3d4/poster",
+      "thumbnail": "/api/characters/a1b2c3d4/poster?v=1788164114",
+      "preview_thumbnail": "/api/characters/a1b2c3d4/poster?v=1788164114",
       "video_path": "/api/characters/a1b2c3d4/video",
       "preview_video_path": "/api/characters/a1b2c3d4/video",
       "bake_status": "ready",
@@ -322,7 +347,7 @@ curl -s "http://36.136.54.165:8888/QeMixAvatar/api/summary?username=u1001"
 | 字段 | 说明 |
 |---|---|
 | `identifier` / `id` | 形象 ID，两者相同。新建为 **8 位**小写十六进制，例如 `a1b2c3d4` |
-| `thumbnail` / `preview_thumbnail` | 封面相对路径，未生成时为空 |
+| `thumbnail` / `preview_thumbnail` | 封面相对路径，未生成时为空。带 `?v=` 版本号，前端必须整段使用并缓存，见 [1.9](#19-封面请缓存前端必做) |
 | `video_path` / `preview_video_path` | 预览视频相对路径，未就绪时为空 |
 | `counts` / `ready_counts` | 在当前用户范围下的公共/个人数量（未传用户 ID 时个人为 0） |
 
@@ -588,7 +613,9 @@ curl -s -X DELETE "http://36.136.54.165:8888/QeMixAvatar/api/avatars/<形象ID>?
 - 公共形象：直接 GET。
 - 个人形象：必须请求头 `X-User-Id`（或 `X-Username`）。
 
-成功：HTTP `200`，`Content-Type: image/jpeg`。
+成功：HTTP `200`，`Content-Type: image/jpeg`。公共封面 `Cache-Control: public, max-age=31536000, immutable`；个人封面 `private, max-age=31536000, immutable`。列表 JSON 里的地址带 `?v=`，请原样使用，见 [1.9](#19-封面请缓存前端必做)。
+
+`?v=` 只表示封面文件版本，**不能**代替 `X-User-Id`，也不能用 `?user_id=` 解锁个人封面。
 
 失败：HTTP `404`，`detail` 为 `形象不存在` 或 `暂无封面`。
 
@@ -629,7 +656,7 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `username` / `user_id` | string | 提交用户，两者相同 |
 | `avatar_identifier` | string | 形象 ID |
 | `avatar_name` | string | 形象名称 |
-| `avatar_thumbnail` | string | 形象封面相对路径 |
+| `avatar_thumbnail` | string | 形象封面相对路径（含 `?v=`，见 1.9） |
 | `avatar_preview_video` / `avatar_video_path` | string | 形象预览视频相对路径 |
 | `avatar_bake_status` | string | 形象转码状态 |
 | `status` | string | `wait` / `run` / `done` / `cancelled` / `error` |
@@ -637,7 +664,7 @@ curl -H "X-User-Id: u1001" -o avatar.mp4 \
 | `progress_message` | string | 进度说明；已取消为 `已取消`，合成失败时为 `合成失败` |
 | `error_message` | string | 仅 `status=error` 时的失败原因；已取消时为空 |
 | `result_path` / `result_path_lbr` | string | 完成后的预览地址，未完成时为空。值为 `/api/tasks/{task_id}/preview` |
-| `result_thumbnail` | string | 完成后的封面（当前为形象封面） |
+| `result_thumbnail` | string | 完成后的封面（当前为形象封面，同样含 `?v=`） |
 | `steps` | int | 合成步数 |
 | `quality_label` | string | `标准` / `高质量` / `超高质量` |
 | `audio_name` | string | 音频文件名 |
@@ -866,3 +893,4 @@ curl -s -X DELETE "http://36.136.54.165:8888/QeMixAvatar/api/tasks/<作品ID>?us
 6. 相对路径拼在 Base URL 后，不要再自己加一层前缀。
 7. 批量上传请按文件并行调用 4.2，不要自行拼接多文件 multipart。中途放弃必须 `abort`；未完成的分片超过 24 小时无活动会被服务端删除。
 8. 作品只保留 15 天。到期后作品记录、成片、音频、临时文件一起删除，列表里也不会再出现。需要长期保存请自行下载。正在合成的任务不会被清掉。
+9. 列表封面必须缓存：`thumbnail` / `result_thumbnail` 带 `?v=`，不要裁掉；`v` 不变则用浏览器或你们中转缓存，不要每次翻页重新拉。个人封面仍须服务端带 `X-User-Id` 中转。视频预览和原片不要按封面去缓存。详见 1.9。
